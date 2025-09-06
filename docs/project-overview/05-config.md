@@ -13,7 +13,6 @@
 - `TP_MODE`: `MARKET_PREENTRY` nebo `LIMIT_ON_FILL`
 - `RAW_PASSTHROUGH`: `true` – neposouvat ceny v enginu, posílat přesně UI hodnoty
 - `DISABLE_LIMIT_TP`: `false` – ponechat limit TP politiku
-- `SAFE_MODE_LONG_ONLY`: `false` – když `true`, zapne sekvenční LONG-only whitelist
 - `PENDING_*` – časování/sweeper parametry
 
 ### decider.json, signals.json, candidates.json

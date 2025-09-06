@@ -47,7 +47,7 @@ export function sanitizeOne(o: AnyObj): AnyObj {
   if (p.side === 'SELL' && p.type === 'LIMIT') {
     console.error('[SANITIZE] SELL LIMIT - returning with closePosition preserved', { symbol: p.symbol })
     // Return a clean copy that preserves closePosition if it was set
-    const clean = {
+    const clean: any = {
       symbol: p.symbol,
       side: p.side,
       type: p.type,
@@ -150,7 +150,7 @@ export function wrapBinanceFuturesClient(futuresHttp: any, safeMode = true) {
 }
 
 // Wrapper for our in-repo BinanceFuturesAPI (signature: request(method, endpoint, params))
-export function wrapBinanceFuturesApi(api: any, safeMode = true) {
+export function wrapBinanceFuturesApi(api: any, safeMode = false) {
   if (!api || typeof api.request !== 'function') return api
   if (!safeMode) return api
   const original = api.request.bind(api)

@@ -90,7 +90,7 @@ class BinanceFuturesAPI {
           } catch {}
           // žádná sanitizace, žádný whitelist
         } else {
-        const safeMode = ((tradingCfg as any)?.SAFE_MODE_LONG_ONLY === true)
+        const safeMode = false
         // === LAST-MILE SANITIZE (nutné vložit těsně před HTTP volání) ===
         const cpAllowed = (t: string) => t === 'STOP_MARKET' || t === 'TAKE_PROFIT_MARKET'
 
@@ -156,19 +156,6 @@ class BinanceFuturesAPI {
             delete o.reduceOnly
           }
 
-          // SAFE mode whitelist LONG-only (block anything else) - pouze pokud je SAFE mode zapnutý
-          if (safeMode) {
-            const allowed = (
-              (String(o.side) === 'BUY' && String(o.type) === 'LIMIT' && o.closePosition !== true) ||
-              (String(o.side) === 'SELL' && String(o.type) === 'STOP_MARKET' && o.closePosition === true) ||
-              (String(o.side) === 'SELL' && String(o.type) === 'TAKE_PROFIT_MARKET' && o.closePosition === true) ||
-              (String(o.side) === 'SELL' && String(o.type) === 'TAKE_PROFIT')
-            )
-            if (!allowed) {
-              try { console.error('[BLOCKED_ORDER]', { symbol: String(o.symbol), side: String(o.side), type: String(o.type), closePosition: !!o.closePosition }) } catch {}
-              throw new Error('SAFE_MODE: blocked non-whitelisted order')
-            }
-          }
 
           // OUTGOING log (one per order)
           try {
@@ -526,7 +513,7 @@ export function getBinanceAPI(): BinanceFuturesAPI {
     try {
       const raw = (tradingCfg as any)?.RAW_PASSTHROUGH === true
       if (!raw) {
-        wrapBinanceFuturesApi(binanceAPI, (tradingCfg as any)?.SAFE_MODE_LONG_ONLY === true)
+        wrapBinanceFuturesApi(binanceAPI)
       } else {
         console.error('[RAW_MODE] Binance client without safe wrapper')
       }
@@ -620,7 +607,7 @@ function waitingTpCleanupIfNoEntry(symbol: string): void {
     // Check if there's still an ENTRY order for this symbol
     getBinanceAPI().getOpenOrders(symbol).then(orders => {
       const hasEntry = (Array.isArray(orders) ? orders : []).some((o: any) => 
-        String(o?.side) === 'BUY' && 
+        String(o?.side) === 'SELL' && 
         String(o?.type) === 'LIMIT' && 
         !(o?.reduceOnly || o?.closePosition)
       )
@@ -740,7 +727,7 @@ async function rehydrateWaitingFromDisk(): Promise<void> {
         if (!keep) {
           try {
             const open = await api.getOpenOrders(w.symbol)
-            const hasEntry = (Array.isArray(open) ? open : []).some((o: any) => String(o?.side) === 'BUY' && String(o?.type) === 'LIMIT')
+            const hasEntry = (Array.isArray(open) ? open : []).some((o: any) => String(o?.side) === 'SELL' && String(o?.type) === 'LIMIT')
             keep = hasEntry
           } catch {}
         }
@@ -832,12 +819,12 @@ export async function executeHotTradingOrdersV1_OLD(request: PlaceOrdersRequest)
       // Simple: send entry, then SL, then TP with exact values from UI
       const entryResult = await api.placeOrder({
         symbol: order.symbol,
-        side: 'BUY',
+        side: 'SELL',
         type: 'LIMIT',
         price: String(order.entry),
         quantity: qty,
         timeInForce: 'GTC',
-        positionSide: 'LONG',
+        positionSide: 'SHORT',
         newOrderRespType: 'RESULT'
       })
       
@@ -849,11 +836,11 @@ export async function executeHotTradingOrdersV1_OLD(request: PlaceOrdersRequest)
       // SL
       const slResult = await api.placeOrder({
         symbol: order.symbol,
-        side: 'SELL',
+        side: 'BUY',
         type: 'STOP_MARKET',
         stopPrice: String(order.sl),
         closePosition: true,
-        positionSide: 'LONG',
+        positionSide: 'SHORT',
         newOrderRespType: 'RESULT'
       })
       
@@ -862,11 +849,11 @@ export async function executeHotTradingOrdersV1_OLD(request: PlaceOrdersRequest)
       // TP
       const tpResult = await api.placeOrder({
         symbol: order.symbol,
-        side: 'SELL',
+        side: 'BUY',
         type: 'TAKE_PROFIT_MARKET',
         stopPrice: String(order.tp),
         closePosition: true,
-        positionSide: 'LONG',
+        positionSide: 'SHORT',
         newOrderRespType: 'RESULT'
       })
       
@@ -922,7 +909,7 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
   const makeId = (p: string) => `${p}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
 
   const killLimitTp = ((tradingCfg as any)?.DISABLE_LIMIT_TP === true)
-  const safeModeLongOnly = ((tradingCfg as any)?.SAFE_MODE_LONG_ONLY === true)
+  const safeModeLongOnly = false
   const tpMode = ((tradingCfg as any)?.TP_MODE === 'LIMIT_ON_FILL') ? 'LIMIT_ON_FILL' as const : 'MARKET_PREENTRY' as const
   
   // DEBUG: Zkontroluj konfiguraci
@@ -932,7 +919,7 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
       safeModeLongOnly, 
       tpModeFromConfig: (tradingCfg as any)?.TP_MODE,
       finalTpMode: tpMode,
-      rawConfig: { DISABLE_LIMIT_TP: (tradingCfg as any)?.DISABLE_LIMIT_TP, SAFE_MODE_LONG_ONLY: (tradingCfg as any)?.SAFE_MODE_LONG_ONLY }
+      rawConfig: { DISABLE_LIMIT_TP: (tradingCfg as any)?.DISABLE_LIMIT_TP }
     })
   } catch {}
 
@@ -940,9 +927,9 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
     console.error('[DEBUG_PROCESSING_ORDER]', { symbol: order.symbol, side: order.side })
     let entryRes: any, tpRes: any, slRes: any;
     try {
-      if (order.side !== 'LONG') { console.warn(`[SIMPLE_BRACKET_SKIP] non-LONG ${order.symbol}`); continue }
+      if (order.side !== 'SHORT') { console.warn(`[SIMPLE_BRACKET_SKIP] non-SHORT ${order.symbol}`); continue }
 
-      let positionSide: 'LONG' | undefined; try { positionSide = (await api.getHedgeMode()) ? 'LONG' : undefined } catch {}
+      let positionSide: 'SHORT' | undefined; try { positionSide = (await api.getHedgeMode()) ? 'SHORT' : undefined } catch {}
       const entryPx = Number(order.entry); if (!entryPx || entryPx <= 0) throw new Error(`Invalid entry price for ${order.symbol}`)
       const notionalUsd = order.amount * order.leverage
       const qty = await api.calculateQuantity(order.symbol, notionalUsd, entryPx)
@@ -990,7 +977,7 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
       // ENTRY LIMIT - use rounded price
       const entryParams: OrderParams & { __engine?: string } = {
         symbol: order.symbol,
-        side: 'BUY',
+        side: 'SELL',
         type: 'LIMIT',
         price: String(entryRounded),
         quantity: qty,
@@ -1004,7 +991,7 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
       // SL STOP_MARKET (always) - use rounded price
       const slParams: OrderParams & { __engine?: string } = {
         symbol: order.symbol,
-        side: 'SELL',
+        side: 'BUY',
         type: 'STOP_MARKET',
         stopPrice: String(slRounded),
         closePosition: true,
@@ -1044,119 +1031,6 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
       }
       try { console.info('[PRICE_PAYLOAD]', payloadLog) } catch {}
 
-      // FORCE SAFE mode only when enabled in config
-      console.error('[DEBUG_BEFORE_SEQUENTIAL_BLOCK]', { symbol: order.symbol })
-      if (safeModeLongOnly) {
-        console.error('[DEBUG_ENTERING_SEQUENTIAL_BLOCK]', { symbol: order.symbol })
-        try { console.info('[SAFE_PLAN]', { symbol: order.symbol, entry: entryRounded, sl: slRounded, tp: tpRounded, mode: 'LONG_ONLY', tpDispatch: 'preentry_or_on_fill' }) } catch {}
-        
-
-
-        // 1. ENTRY PRVNÍ
-        console.error('[STEP_1_SENDING_ENTRY]', { symbol: order.symbol })
-        entryRes = await api.placeOrder(entryParams)
-        console.error('[STEP_1_ENTRY_SUCCESS]', { symbol: order.symbol, orderId: entryRes?.orderId })
-        
-        // 2. POČKAT 3-4 SEKUNDY na naplnění ENTRY
-        console.error('[STEP_2_WAITING_FOR_ENTRY_FILL]', { symbol: order.symbol, waiting: '3-4 seconds' })
-        await sleep(3500) // 3.5 sekundy
-        
-        // 3. ZKONTROLUJ, jestli máme pozici a získej quantity
-        let hasPosition = false
-        let positionQty = qty // Default na původní vypočítanou quantity
-        try {
-          const size = await waitForPositionSize(order.symbol, { sideLong: true, positionSide }, 2000)
-          hasPosition = Number(size) > 0
-          if (hasPosition) positionQty = String(size)
-          console.error('[STEP_2_POSITION_CHECK]', { symbol: order.symbol, hasPosition, size, positionQty })
-        } catch {}
-        
-        // 4. Rozhodni podle MARK a přítomnosti pozice, aby se zabránilo -2021 (would immediately trigger)
-        let markPx: number | null = null
-        try { markPx = await api.getMarkPrice(order.symbol) } catch {}
-        const tpOk = hasPosition || (tpRounded > Number(markPx))
-        const slOk = hasPosition || (slRounded < Number(markPx))
-
-        console.error('[STEP_3_POLICY]', { symbol: order.symbol, phase: 'SAFE', hasPosition, quantity: positionQty, mark: markPx, tp: tpRounded, sl: slRounded, tpOk, slOk })
-
-        // Build params depending on whether we already have a position
-        const tpParamsHasPos: OrderParams & { __engine?: string } = {
-          symbol: order.symbol,
-          side: 'SELL',
-          type: 'TAKE_PROFIT',
-          price: String(tpRounded),
-          quantity: positionQty,
-          reduceOnly: true,
-          timeInForce: 'GTC',
-          workingType,
-          positionSide,
-          newClientOrderId: makeId('x_tp_tm'),
-          newOrderRespType: 'RESULT',
-          __engine: 'v2_simple_bracket_immediate'
-        }
-        const slParamsHasPos: OrderParams & { __engine?: string } = {
-          symbol: order.symbol,
-          side: 'SELL',
-          type: 'STOP_MARKET',
-          stopPrice: String(slRounded),
-          quantity: positionQty,
-          reduceOnly: true,
-          workingType,
-          positionSide,
-          newClientOrderId: makeId('x_sl'),
-          newOrderRespType: 'RESULT',
-          __engine: 'v2_simple_bracket_immediate'
-        }
-        const tpParamsPre: OrderParams & { __engine?: string } = {
-          symbol: order.symbol,
-          side: 'SELL',
-          type: 'TAKE_PROFIT_MARKET',
-          stopPrice: String(tpRounded),
-          closePosition: true,
-          workingType,
-          positionSide,
-          newClientOrderId: makeId('x_tp_tm'),
-          newOrderRespType: 'RESULT',
-          __engine: 'v2_simple_bracket_immediate'
-        }
-        const slParamsPre: OrderParams & { __engine?: string } = {
-          symbol: order.symbol,
-          side: 'SELL',
-          type: 'STOP_MARKET',
-          stopPrice: String(slRounded),
-          closePosition: true,
-          workingType,
-          positionSide,
-          newClientOrderId: makeId('x_sl'),
-          newOrderRespType: 'RESULT',
-          __engine: 'v2_simple_bracket_immediate'
-        }
-
-        try {
-          if (hasPosition) {
-            // S pozicí: SL + TP LIMIT současně
-            ;[slRes, tpRes] = await Promise.all([api.placeOrder(slParamsHasPos), api.placeOrder(tpParamsHasPos)])
-          } else {
-            // Bez pozice: nejprve SL (pokud OK), pak TP MARKET zvlášť, aby se TP nevynechal při částečném failu
-            slRes = slOk ? await api.placeOrder(slParamsPre) : null
-            tpRes = tpOk ? await api.placeOrder(tpParamsPre) : null
-          }
-        } catch (exitError: any) {
-          console.error('[SL_TP_ERROR]', { symbol: order.symbol, error: exitError?.message })
-          // Pokračuj i když SL/TP selže
-        }
-        try {
-          console.info('[SL_TP_ECHO_BRIEF]', {
-            symbol: order.symbol,
-            sl: { id: slRes?.orderId ?? null, type: slRes?.type ?? null, stopPrice: slRes?.stopPrice ?? null },
-            tp: { id: tpRes?.orderId ?? null, type: tpRes?.type ?? null, stopPrice: tpRes?.stopPrice ?? null }
-          })
-        } catch {}
-        console.error('[STEP_3_SL_TP_SUCCESS]', { symbol: order.symbol, tpId: tpRes?.orderId, slId: slRes?.orderId })
-        // Continue to next order in SAFE mode
-        results.push({ symbol: order.symbol, status: 'executed', entry_order: entryRes, sl_order: slRes, tp_order: tpRes })
-        continue
-      }
 
       // Non-safe path: original policy
       // Send ENTRY first
@@ -1168,7 +1042,7 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
         // Change requested: send TP as LIMIT with qty (no reduceOnly) pre-entry
         const tpParams: OrderParams & { __engine?: string } = {
           symbol: order.symbol,
-          side: 'SELL',
+          side: 'BUY',
           type: 'TAKE_PROFIT',
           price: String(tpRounded),
           stopPrice: String(tpRounded),
@@ -1195,7 +1069,7 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
         // 2) TP LIMIT hned (bez reduceOnly, bez closePosition)
         const tpLimitParams: OrderParams & { __engine?: string } = {
           symbol: order.symbol,
-          side: 'SELL',
+          side: 'BUY',
           type: 'TAKE_PROFIT',
           price: String(tpRounded),
           stopPrice: String(tpRounded),
@@ -1294,7 +1168,7 @@ async function executeHotTradingOrdersV3_Batch2s(request: PlaceOrdersRequest): P
     symbol: string
     order: PlaceOrdersRequest['orders'][number]
     qty: string
-    positionSide: 'LONG' | undefined
+    positionSide: 'SHORT' | undefined
     entryParams: OrderParams & { __engine?: string }
     rounded: { entry: string, sl: string, tp: string, qty: string }
   }
@@ -1303,10 +1177,10 @@ async function executeHotTradingOrdersV3_Batch2s(request: PlaceOrdersRequest): P
 
   for (const order of request.orders) {
     try {
-      if (order.side !== 'LONG') { console.warn(`[BATCH_SKIP] non-LONG ${order.symbol}`); continue }
+      if (order.side !== 'SHORT') { console.warn(`[BATCH_SKIP] non-SHORT ${order.symbol}`); continue }
 
-      let positionSide: 'LONG' | undefined
-      try { positionSide = (await api.getHedgeMode()) ? 'LONG' : undefined } catch {}
+      let positionSide: 'SHORT' | undefined
+      try { positionSide = (await api.getHedgeMode()) ? 'SHORT' : undefined } catch {}
 
       const entryPx = Number(order.entry); if (!entryPx || entryPx <= 0) throw new Error(`Invalid entry price for ${order.symbol}`)
       const notionalUsd = order.amount * order.leverage
@@ -1342,7 +1216,7 @@ async function executeHotTradingOrdersV3_Batch2s(request: PlaceOrdersRequest): P
 
       const entryParams: OrderParams & { __engine?: string } = {
         symbol: order.symbol,
-        side: 'BUY',
+        side: 'SELL',
         type: 'LIMIT',
         price: entryStr,
         quantity: qty,
@@ -1409,7 +1283,7 @@ async function executeHotTradingOrdersV3_Batch2s(request: PlaceOrdersRequest): P
   for (const p of prepared) {
     const slParams: OrderParams & { __engine?: string } = {
       symbol: p.symbol,
-      side: 'SELL',
+      side: 'BUY',
       type: 'STOP_MARKET',
       stopPrice: p.rounded.sl,
       closePosition: true,

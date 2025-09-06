@@ -64,7 +64,7 @@ class BinanceFuturesAPI {
       const methodUp = String(method || '').toUpperCase()
       const isOrderPost = methodUp === 'POST' && (endpoint === '/fapi/v1/order' || endpoint === '/fapi/v1/batchOrders')
       if (isOrderPost) {
-        const safeMode = ((tradingCfg as any)?.SAFE_MODE_LONG_ONLY === true)
+        const safeMode = false
         const tpModeCfg = ((tradingCfg as any)?.TP_MODE === 'LIMIT_ON_FILL')
           // === LAST-MILE SANITIZACE (AGRESIVNÍ OPRAVY PRO 100% FUNKČNOST) ===
           const cpAllowed = (t: string) => t === 'STOP_MARKET' || t === 'TAKE_PROFIT_MARKET'
@@ -120,19 +120,6 @@ class BinanceFuturesAPI {
               delete o.reduceOnly
             }
 
-          // SAFE mode whitelist
-          if (safeMode) {
-            const allowed = (
-              (String(o.side) === 'BUY' && (String(o.type) === 'LIMIT' || String(o.type) === 'MARKET') && o.closePosition !== true) ||
-              (String(o.side) === 'SELL' && String(o.type) === 'STOP_MARKET' && (o.closePosition === true || o.reduceOnly === true)) ||
-              (String(o.side) === 'SELL' && String(o.type) === 'TAKE_PROFIT_MARKET' && (o.closePosition === true || o.reduceOnly === true)) ||
-              (String(o.side) === 'SELL' && String(o.type) === 'TAKE_PROFIT')
-            )
-            if (!allowed) {
-              try { console.error('[BLOCKED_ORDER]', { engine: engineTag, symbol: String(o.symbol), side: String(o.side), type: String(o.type), closePosition: !!o.closePosition, reduceOnly: !!o.reduceOnly }) } catch {}
-              throw new Error('SAFE_MODE: blocked non-whitelisted order')
-            }
-          }
 
           try {
             console.info('[OUTGOING_ORDER]', {
@@ -308,7 +295,7 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
     console.error('[TP_CONFIG_DEBUG]', { 
       finalTpMode: tpMode,
       mode: 'BATCH_SAFE',
-      rawConfig: { DISABLE_LIMIT_TP: (tradingCfg as any)?.DISABLE_LIMIT_TP, SAFE_MODE_LONG_ONLY: (tradingCfg as any)?.SAFE_MODE_LONG_ONLY }
+      rawConfig: { DISABLE_LIMIT_TP: (tradingCfg as any)?.DISABLE_LIMIT_TP }
     })
   } catch {}
 
@@ -317,9 +304,9 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
   
   for (const order of request.orders) {
     try {
-      if (order.side !== 'LONG') { console.warn(`[BATCH_SKIP] non-LONG ${order.symbol}`); continue }
+      if (order.side !== 'SHORT') { console.warn(`[BATCH_SKIP] non-SHORT ${order.symbol}`); continue }
 
-      let positionSide: 'LONG' | undefined; try { positionSide = (await api.getHedgeMode()) ? 'LONG' : undefined } catch {}
+      let positionSide: 'SHORT' | undefined; try { positionSide = (await api.getHedgeMode()) ? 'SHORT' : undefined } catch {}
       const entryPx = Number(order.entry); if (!entryPx || entryPx <= 0) throw new Error(`Invalid entry price for ${order.symbol}`)
       const notionalUsd = order.amount * order.leverage
       const qty = await api.calculateQuantity(order.symbol, notionalUsd, entryPx)
@@ -337,7 +324,7 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
       const isMarketEntry = (order.orderType === 'market')
       const entryParams: OrderParams & { __engine?: string } = {
         symbol: order.symbol,
-        side: 'BUY',
+        side: 'SELL',
         type: isMarketEntry ? 'MARKET' : 'LIMIT',
         ...(isMarketEntry ? {} : { price: String(entryRounded), timeInForce: 'GTC' }),
         quantity: qty,
@@ -459,10 +446,10 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
         let slParams: OrderParams & { __engine?: string }
         
         if (hasPosition) {
-          // S pozicí: quantity + reduceOnly - LIMIT TP (musí být TP > Entry pro LONG!)
+          // S pozicí: quantity + reduceOnly - LIMIT TP (musí být TP < Entry pro SHORT!)
           tpParams = { 
             symbol, 
-            side: 'SELL', 
+            side: 'BUY', 
             type: 'TAKE_PROFIT', 
             price: String(data.order.tp), 
             quantity: positionQty,
@@ -474,7 +461,7 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
           }
           slParams = { 
             symbol, 
-            side: 'SELL', 
+            side: 'BUY', 
             type: 'STOP_MARKET', 
             stopPrice: String(slRounded), 
             quantity: positionQty,
@@ -488,7 +475,7 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
           // Bez pozice: closePosition=true (bez quantity, bez reduceOnly)
           tpParams = { 
             symbol, 
-            side: 'SELL', 
+            side: 'BUY', 
             type: 'TAKE_PROFIT_MARKET', 
             stopPrice: String(tpRounded), 
             closePosition: true,
@@ -499,7 +486,7 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
           }
           slParams = { 
             symbol, 
-            side: 'SELL', 
+            side: 'BUY', 
             type: 'STOP_MARKET', 
             stopPrice: String(slRounded), 
             closePosition: true,
@@ -517,7 +504,7 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
           slRes = await api.placeOrder(slParams)
           const tpLimit: OrderParams & { __engine?: string } = {
             symbol,
-            side: 'SELL',
+            side: 'BUY',
             type: 'TAKE_PROFIT',
             price: String(data.order.tp),
             stopPrice: String(tpRounded),
