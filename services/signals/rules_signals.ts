@@ -29,10 +29,10 @@ export function buildSignalSet(f: FeaturesSnapshot, decision: MarketDecision, ca
   const expires = (signalsCfg as any).expires_in_min ?? 45
 
   for (const r of candidates) {
-    const isLong = r.ema_order_H1 === '20>50>200' && (r.vwap_rel_M15 ?? 0) > 0 && (r.RSI_M15 ?? 0) >= 45 && (r.RSI_M15 ?? 0) <= 70
-    const isShort = r.ema_order_H1 === '200>50>20' && (r.vwap_rel_M15 ?? 0) < 0 && (r.RSI_M15 ?? 0) >= 30 && (r.RSI_M15 ?? 0) <= 55
-    if (!isLong && !isShort) continue
-    const side = isLong ? 'LONG' : 'SHORT'
+    // SHORT-only bias
+    const isShort = r.ema_order_H1 === '200>50>20' && (r.vwap_rel_M15 ?? 0) < 0 && (r.RSI_M15 ?? 0) >= 25 && (r.RSI_M15 ?? 0) <= 45
+    if (!isShort) continue
+    const side = 'SHORT'
     const risk_pct = riskMap[decision.flag] ?? 0.5
     const entry = 'limit @ last_close'
     const slMult = Math.max(1.0, lim.min_sl_atr_mult ?? 1.0)
@@ -40,12 +40,9 @@ export function buildSignalSet(f: FeaturesSnapshot, decision: MarketDecision, ca
     const tp = ['1.0R','1.8R','3.0R']
     const trailing = '1x ATR after TP1'
     const why: string[] = []
-    if (isLong) why.push('H1 trend up (20>50>200)')
-    if (isShort) why.push('H1 trend down (200>50>20)')
-    if ((r.vwap_rel_M15 ?? 0) > 0) why.push('VWAP M15 above')
+    why.push('H1 trend down (200>50>20)')
     if ((r.vwap_rel_M15 ?? 0) < 0) why.push('VWAP M15 below')
-    if ((r.RSI_M15 ?? 0) >= 45 && (r.RSI_M15 ?? 0) <= 70) why.push('RSI M15 ok')
-    if ((r.RSI_M15 ?? 0) >= 30 && (r.RSI_M15 ?? 0) <= 55) why.push('RSI M15 ok')
+    if ((r.RSI_M15 ?? 0) >= 25 && (r.RSI_M15 ?? 0) <= 45) why.push('RSI M15 ok')
 
     // Sanity guard: TP1 >= min_tp1_R (textová kontrola – ponecháme 1.0R min., vyšší prahy propustíme jen pokud splněny)
     const minTp1 = lim.min_tp1_R ?? 0.8

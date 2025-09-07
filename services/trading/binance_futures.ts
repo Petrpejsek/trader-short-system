@@ -33,8 +33,9 @@ export interface PlaceOrdersRequest {
     strategy: 'conservative' | 'aggressive'
     tpLevel: 'tp1' | 'tp2' | 'tp3'
     orderType?: 'market' | 'limit' | 'stop' | 'stop_limit'
-    amount: number // USD amount to invest
-    leverage: number
+    amount: number // USD amount to invest (unused in RAW mode)
+    leverage: number // unused for qty calc in RAW mode
+    quantity?: string // REQUIRED in RAW passthrough mode; exact Binance qty string
     useBuffer: boolean
     bufferPercent?: number
     entry?: number
@@ -49,13 +50,13 @@ class BinanceFuturesAPI {
   private baseURL = 'https://fapi.binance.com'
 
   constructor() {
-    this.apiKey = process.env.BINANCE_API_KEY || 'mock_api_key'
-    this.secretKey = process.env.BINANCE_SECRET_KEY || 'mock_secret_key'
+    this.apiKey = process.env.BINANCE_API_KEY || ''
+    this.secretKey = process.env.BINANCE_SECRET_KEY || ''
     
-    // In production, uncomment this check:
-    // if (!this.apiKey || !this.secretKey) {
-    //   throw new Error('Missing Binance API credentials')
-    // }
+    // STRICT: No fallbacks - crash without proper credentials
+    if (!this.apiKey || !this.secretKey || this.apiKey.includes('mock') || this.secretKey.includes('mock')) {
+      throw new Error('Missing or invalid Binance API credentials - no fallbacks allowed')
+    }
   }
 
   private sign(queryString: string): string {
@@ -562,6 +563,7 @@ export function getWaitingTpList(): WaitingTpEntry[] {
 
 function waitingTpSchedule(symbol: string, tp: number, qtyPlanned: string | null, positionSide?: 'LONG'|'SHORT'|undefined, workingType?: 'MARK_PRICE' | 'CONTRACT_PRICE'): void {
   try {
+    console.error('[WAITING_TP_SCHEDULE_CALLED]', { symbol, tp, qtyPlanned, positionSide, workingType })
     waitingTpBySymbol[symbol] = {
       symbol,
       tp: Number(tp),
@@ -574,23 +576,34 @@ function waitingTpSchedule(symbol: string, tp: number, qtyPlanned: string | null
       positionSide: positionSide ?? null,
       workingType: workingType ?? 'MARK_PRICE',
       lastError: null,
-      lastErrorAt: null
+      lastErrorAt: null,
+      protectedUntil: new Date(Date.now() + 15000).toISOString() // 15s protection against cleanup
     }
+    console.error('[WAITING_TP_ADDED_TO_MEMORY]', { symbol, count: Object.keys(waitingTpBySymbol).length })
     persistWaitingState()
-  } catch {}
+    console.error('[WAITING_TP_PERSISTED]', { symbol })
+  } catch (err) {
+    console.error('[WAITING_TP_SCHEDULE_ERROR]', { symbol, error: err?.message || err })
+  }
 }
 
 function waitingTpOnCheck(symbol: string, positionSize: number | null): void {
   try {
     const w = waitingTpBySymbol[symbol]
-    if (!w) return
+    if (!w) {
+      console.error('[WAITING_TP_CHECK_NO_ENTRY]', { symbol, reason: 'not_in_waiting' })
+      return
+    }
+    console.error('[WAITING_TP_CHECK]', { symbol, positionSize, currentChecks: w.checks })
     w.lastCheck = new Date().toISOString()
     if (Number.isFinite(positionSize as any)) w.positionSize = positionSize as number
     // přepnuto: "checks" nyní znamená po sobě jdoucí nenulové checky
     if (Number.isFinite(positionSize as any) && (positionSize as number) > 0) {
       w.checks = (w.checks || 0) + 1
+      console.error('[WAITING_TP_CHECK_POSITION_FOUND]', { symbol, size: positionSize, checks: w.checks })
     } else {
       w.checks = 0
+      console.error('[WAITING_TP_CHECK_NO_POSITION]', { symbol })
     }
     // nezapisujeme každé kolo kvůli IO; stačí při schedule/sent/chybě
   } catch {}
@@ -601,24 +614,7 @@ function waitingTpOnSent(symbol: string): void {
   try { persistWaitingState() } catch {}
 }
 
-function waitingTpCleanupIfNoEntry(symbol: string): void {
-  try {
-    if (!waitingTpBySymbol[symbol]) return
-    // Check if there's still an ENTRY order for this symbol
-    getBinanceAPI().getOpenOrders(symbol).then(orders => {
-      const hasEntry = (Array.isArray(orders) ? orders : []).some((o: any) => 
-        String(o?.side) === 'SELL' && 
-        String(o?.type) === 'LIMIT' && 
-        !(o?.reduceOnly || o?.closePosition)
-      )
-      if (!hasEntry) {
-        console.error('[WAITING_AUTO_CLEANUP]', { symbol, reason: 'no_entry_order_found' })
-        delete waitingTpBySymbol[symbol]
-        persistWaitingState()
-      }
-    }).catch(() => {})
-  } catch {}
-}
+// REMOVED: waitingTpCleanupIfNoEntry - nesmí se automaticky mazat waiting TP ordery!
 
 export function cleanupWaitingTpForSymbol(symbol: string): void {
   try {
@@ -632,6 +628,7 @@ export function cleanupWaitingTpForSymbol(symbol: string): void {
 export async function waitingTpProcessPassFromPositions(positionsRaw: any[]): Promise<void> {
   const api = getBinanceAPI()
   try {
+    console.error('[WAITING_TP_PROCESS_START]', { waitingCount: Object.keys(waitingTpBySymbol).length, positionsCount: Array.isArray(positionsRaw) ? positionsRaw.length : 0 })
     const list = Array.isArray(positionsRaw) ? positionsRaw : []
     const sizeBySymbol: Record<string, { size: number; side: 'LONG' | 'SHORT' | null }> = {}
     for (const p of list) {
@@ -641,17 +638,33 @@ export async function waitingTpProcessPassFromPositions(positionsRaw: any[]): Pr
         const amt = Number(p?.positionAmt)
         const size = Number.isFinite(amt) ? Math.abs(amt) : 0
         const side: 'LONG' | 'SHORT' | null = Number.isFinite(amt) ? (amt < 0 ? 'SHORT' : 'LONG') : null
+        if (size > 0) console.error('[WAITING_TP_POSITION_FOUND]', { symbol: sym, size, side })
         sizeBySymbol[sym] = { size, side }
       } catch {}
     }
+    // Cleanup starých waiting orderů (starších než 30 minut) před processing
+    const now = Date.now()
+    for (const [symbol, w] of Object.entries(waitingTpBySymbol)) {
+      try {
+        const ageMinutes = (now - new Date(w.since).getTime()) / (1000 * 60)
+        console.error('[WAITING_AGE_CHECK]', { symbol, ageMinutes: Math.round(ageMinutes), willDelete: ageMinutes > 30 })
+        if (ageMinutes > 30) {
+          console.error('[WAITING_CLEANUP_OLD]', { symbol, ageMinutes: Math.round(ageMinutes) })
+          delete waitingTpBySymbol[symbol]
+        }
+      } catch {}
+    }
+    
     const entries = Object.entries(waitingTpBySymbol)
+    console.error('[WAITING_TP_ENTRIES_TO_PROCESS]', { count: entries.length, symbols: entries.map(([sym]) => sym) })
     for (const [symbol, w] of entries) {
       const rec = sizeBySymbol[symbol] || { size: 0, side: null }
       const size = rec.size
       waitingTpOnCheck(symbol, size)
       // Žádné REST dotazy na openOrders – cleanup řeší server na základě WS snapshotu
       // Place TP LIMIT as soon as pozice existuje (bez čekání na druhý průchod)
-      if (size > 0 && w.checks >= 1) {
+      if (size > 0) {  // Send TP as soon as position exists (no need for multiple checks)
+        console.error('[TP_DELAY_PROCESSING_START]', { symbol, size, tp: w.tp, qtyPlanned: w.qtyPlanned })
         const qtyStr = String(size)
         const workingType = (w.workingType === 'CONTRACT_PRICE') ? 'CONTRACT_PRICE' : 'MARK_PRICE'
         const positionSide = (w.positionSide === 'SHORT' || rec.side === 'SHORT') ? 'SHORT' : 'LONG'
@@ -665,7 +678,7 @@ export async function waitingTpProcessPassFromPositions(positionsRaw: any[]): Pr
           quantity: qtyStr,
           workingType,
           positionSide,
-          newClientOrderId: `x_tp_l_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,6)}`,
+          newClientOrderId: `x_tp_l_short_real_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,6)}`,
           newOrderRespType: 'RESULT',
           __engine: 'v3_batch_2s'
         }
@@ -673,7 +686,10 @@ export async function waitingTpProcessPassFromPositions(positionsRaw: any[]): Pr
         try {
           const tpRes = await (api as any).placeOrder(tpParams)
           console.error('[TP_DELAY_SENT]', { symbol, orderId: tpRes?.orderId })
-          waitingTpOnSent(symbol)
+          // OPRAVENO: Smazat z waiting JEN při úspěšném API callu
+          if (tpRes?.orderId) {
+            waitingTpOnSent(symbol)
+          }
         } catch (e: any) {
           const msg = String(e?.message || e)
           try {
@@ -811,10 +827,9 @@ export async function executeHotTradingOrdersV1_OLD(request: PlaceOrdersRequest)
     try {
       console.log(`[V1_ORDER] Processing ${order.symbol}`)
       
-      // Calculate proper quantity like V3
-      const entryPx = Number(order.entry)
-      const notionalUsd = order.amount * order.leverage
-      const qty = await api.calculateQuantity(order.symbol, notionalUsd, entryPx)
+      // RAW passthrough: vyžaduj explicitní quantity z požadavku
+      const qty = String((order as any).quantity || '')
+      if (!qty) throw new Error('Missing quantity for RAW passthrough')
       
       // Simple: send entry, then SL, then TP with exact values from UI
       const entryResult = await api.placeOrder({
@@ -906,7 +921,7 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
     }
   }> = []
   const api = getBinanceAPI()
-  const makeId = (p: string) => `${p}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+  const makeId = (p: string) => `${p}_${String(process.env.CLIENT_ID_NS || 'short_real')}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
 
   const killLimitTp = ((tradingCfg as any)?.DISABLE_LIMIT_TP === true)
   const safeModeLongOnly = false
@@ -931,8 +946,8 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
 
       let positionSide: 'SHORT' | undefined; try { positionSide = (await api.getHedgeMode()) ? 'SHORT' : undefined } catch {}
       const entryPx = Number(order.entry); if (!entryPx || entryPx <= 0) throw new Error(`Invalid entry price for ${order.symbol}`)
-      const notionalUsd = order.amount * order.leverage
-      const qty = await api.calculateQuantity(order.symbol, notionalUsd, entryPx)
+      const qty = String((order as any).quantity || '')
+      if (!qty) throw new Error('Missing quantity for RAW passthrough')
       const workingType: 'MARK_PRICE' = 'MARK_PRICE'
       // Align Binance leverage to UI value before placing orders so margin/equity math matches UI intent
       try {
@@ -958,9 +973,13 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
         }
       } catch {}
       const rawMode = ((tradingCfg as any)?.RAW_PASSTHROUGH === true)
-      const entryRounded = rawMode ? Number(order.entry) : roundToTickSize(entryPx, Number(symbolFilters.tickSize))
-      const slRounded = rawMode ? Number(order.sl) : roundToTickSize(Number(order.sl), Number(symbolFilters.tickSize))
-      const tpRounded = rawMode ? Number(order.tp) : roundToTickSize(Number(order.tp), Number(symbolFilters.tickSize))
+      // STRICT: Validate tickSize before rounding - no null fallbacks allowed
+      if (!rawMode && (!Number.isFinite(symbolFilters.tickSize) || symbolFilters.tickSize <= 0)) {
+        throw new Error(`Invalid or missing tickSize for ${order.symbol} - no fallbacks allowed`)
+      }
+      const entryRounded = rawMode ? Number(order.entry) : roundToTickSize(entryPx, symbolFilters.tickSize!)
+      const slRounded = rawMode ? Number(order.sl) : roundToTickSize(Number(order.sl), symbolFilters.tickSize!)
+      const tpRounded = rawMode ? Number(order.tp) : roundToTickSize(Number(order.tp), symbolFilters.tickSize!)
       
       // Price rounding already done above
 
@@ -1157,10 +1176,11 @@ function roundToTickSize(price: number, tickSize: number): number {
 // 2) Wait 2 seconds
 // 3) Send ALL SL and TP orders in parallel
 async function executeHotTradingOrdersV3_Batch2s(request: PlaceOrdersRequest): Promise<any> {
+  console.error('[V3_BATCH_START]', { orderCount: request.orders.length })
   const api = getBinanceAPI()
   const results: Array<any> = []
   const priceLogs: Array<any> = []
-  const makeId = (p: string) => `${p}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+  const makeId = (p: string) => `${p}_${String(process.env.CLIENT_ID_NS || 'short_real')}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
   const workingType: 'MARK_PRICE' = 'MARK_PRICE'
 
   // Prepare all orders (compute qty, params)
@@ -1183,8 +1203,8 @@ async function executeHotTradingOrdersV3_Batch2s(request: PlaceOrdersRequest): P
       try { positionSide = (await api.getHedgeMode()) ? 'SHORT' : undefined } catch {}
 
       const entryPx = Number(order.entry); if (!entryPx || entryPx <= 0) throw new Error(`Invalid entry price for ${order.symbol}`)
-      const notionalUsd = order.amount * order.leverage
-      const qty = await api.calculateQuantity(order.symbol, notionalUsd, entryPx)
+      const qty = String((order as any).quantity || '')
+      if (!qty) throw new Error('Missing quantity for RAW passthrough')
 
       // Get Binance filters for price precision and round prices
       let symbolFilters = { tickSize: null as number | null, stepSize: null as number | null, pricePrecision: null as number | null }
@@ -1244,6 +1264,12 @@ async function executeHotTradingOrdersV3_Batch2s(request: PlaceOrdersRequest): P
     }
   }
 
+  // FAIL FAST: pokud po přípravě není žádná validní SHORT objednávka, vrať explicitní chybu (žádné tiché success)
+  if (prepared.length === 0) {
+    try { console.error('[BATCH_PREPARED_EMPTY]', { reason: 'no_valid_short_orders' }) } catch {}
+    return { success: false, orders: [], error: 'no_valid_orders', engine: 'v3_batch_2s', timestamp: new Date().toISOString() }
+  }
+
   // Phase 1: Send ALL ENTRY orders in parallel
   console.error('[BATCH_PHASE_1_ALL_ENTRIES_PARALLEL]', { count: prepared.length, ts: new Date().toISOString() })
   const entrySettled: Array<any> = []
@@ -1274,47 +1300,70 @@ async function executeHotTradingOrdersV3_Batch2s(request: PlaceOrdersRequest): P
   console.error('[BATCH_PHASE_2_WAIT]', { ms: 3000, ts: new Date().toISOString() })
   await sleep(3000)
 
-  // Phase 3: Send ALL SL immediately; TP LIMIT reduceOnly will be deferred until position exists
+  // Phase 3: Send SL only for successful ENTRY orders; TP LIMIT reduceOnly will be deferred until position exists
   console.error('[BATCH_PHASE_3_ALL_EXITS_PARALLEL]', { ts: new Date().toISOString() })
   const exitPromises: Array<Promise<any>> = []
-  const exitIndex: Array<{ symbol: string; kind: 'SL' }> = []
+  const exitIndex: Array<{ symbol: string; kind: 'SL' | 'TP' }> = []
 
-  // Start SL now for all symbols
+  // No need to filter by successful entries - send SL/TP for all symbols with quantity
+
+  // NO IMMEDIATE TP - all TP goes through waiting system only
+
+  // Start SL immediately for all symbols with successful ENTRY API calls
   for (const p of prepared) {
+    const entryApiSuccess = entrySettled.some((r: any) => 
+      r.status === 'fulfilled' && r.value?.ok && r.value?.symbol === p.symbol
+    )
+    if (!entryApiSuccess) {
+      console.error('[SL_SKIP_NO_ENTRY_API]', { symbol: p.symbol, reason: 'entry_api_failed' })
+      continue
+    }
+    
+    console.error('[SL_ENTRY_API_OK]', { symbol: p.symbol })
     const slParams: OrderParams & { __engine?: string } = {
       symbol: p.symbol,
       side: 'BUY',
       type: 'STOP_MARKET',
       stopPrice: p.rounded.sl,
-      closePosition: true,
+      closePosition: true,  // Use closePosition instead of reduceOnly + quantity
       workingType,
       positionSide: p.positionSide,
       newClientOrderId: makeId('x_sl'),
       newOrderRespType: 'RESULT',
       __engine: 'v3_batch_2s'
     }
-    exitPromises.push(api.placeOrder(slParams))
+    exitPromises.push(api.placeOrder(slParams).catch(err => {
+      console.error('[SL_ORDER_IMMEDIATE_ERROR]', { symbol: p.symbol, error: err?.message || err })
+      throw err
+    }))
     exitIndex.push({ symbol: p.symbol, kind: 'SL' })
-  }
-
-  // Defer TP LIMIT reduceOnly until a real position exists; schedule background pollers per symbol
-  for (const p of prepared) {
-    spawnDeferredTpPoller(p.symbol, p.rounded.tp, String(p.rounded.qty), p.positionSide, workingType).catch(()=>{})
   }
 
   const exitSettledRaw = await Promise.allSettled(exitPromises)
   const exitSettled: Array<any> = []
   for (let i = 0; i < exitSettledRaw.length; i += 1) {
-    const slRes = exitSettledRaw[i]
+    const exitRes = exitSettledRaw[i]
     const symbol = exitIndex[i]?.symbol || 'UNKNOWN'
-    const ok = slRes.status === 'fulfilled'
-    exitSettled.push({
-      symbol,
-      ok,
-      sl: slRes.status === 'fulfilled' ? slRes.value : null,
-      tp: null,
-      error: ok ? null : (slRes as any)?.reason?.message || 'unknown'
-    })
+    const kind = exitIndex[i]?.kind || 'UNKNOWN'
+    const ok = exitRes.status === 'fulfilled'
+    
+    // Find existing entry for this symbol or create new one
+    let existing = exitSettled.find(e => e.symbol === symbol)
+    if (!existing) {
+      existing = { symbol, ok: true, sl: null, tp: null, error: null }
+      exitSettled.push(existing)
+    }
+    
+    if (kind === 'SL') {
+      existing.sl = ok ? exitRes.value : null
+      if (!ok) existing.error = (exitRes as any)?.reason?.message || 'sl_error'
+    } else if (kind === 'TP') {
+      existing.tp = ok ? exitRes.value : null
+      if (!ok && !existing.error) existing.error = (exitRes as any)?.reason?.message || 'tp_error'
+    }
+    
+    // Mark overall success only if both didn't fail
+    if (!ok) existing.ok = false
   }
 
   // Aggregate
@@ -1326,15 +1375,40 @@ async function executeHotTradingOrdersV3_Batch2s(request: PlaceOrdersRequest): P
       bySymbol[v.symbol] = { ...bySymbol[v.symbol], entry_order: v.ok ? v.res : null, entry_error: v.ok ? null : v.error }
     }
   })
-  // Process exit results (SL + TP are already combined in exitSettled)
+  // Process exit results (only SL immediate, TP is waiting)
   exitSettled.forEach((r: any) => {
-    bySymbol[r.symbol] = { ...bySymbol[r.symbol], sl_order: r.sl ?? null, tp_order: r.tp ?? null, exit_error: r.error }
+    bySymbol[r.symbol] = { ...bySymbol[r.symbol], sl_order: r.sl ?? null, exit_error: r.error }
+  })
+  
+  // Add TP to waiting system for all symbols with successful ENTRY API calls
+  console.error('[TP_DEBUG_ENTRY_SETTLED]', { entrySettled: entrySettled.map((r: any) => ({ status: r.status, ok: r.value?.ok, symbol: r.value?.symbol })) })
+  prepared.forEach(p => {
+    const entryApiSuccess = entrySettled.some((r: any) => 
+      r.status === 'fulfilled' && r.value?.ok && r.value?.symbol === p.symbol
+    )
+    console.error('[TP_DEBUG_ENTRY_CHECK]', { symbol: p.symbol, entryApiSuccess, entrySettledCount: entrySettled.length })
+    if (entryApiSuccess) {
+      console.error('[TP_ADD_TO_WAITING_FINAL]', { symbol: p.symbol, tp: p.rounded.tp, qty: p.rounded.qty })
+      waitingTpSchedule(p.symbol, Number(p.rounded.tp), String(p.rounded.qty), p.positionSide, workingType)
+      if (!bySymbol[p.symbol]) bySymbol[p.symbol] = { symbol: p.symbol }
+      bySymbol[p.symbol].tp_order = 'waiting'
+    } else {
+      console.error('[TP_SKIP_NO_ENTRY_SUCCESS]', { symbol: p.symbol, entrySettled })
+    }
   })
 
   const final = Object.values(bySymbol)
   final.forEach((r: any) => {
     const status = (!r.entry_error && !r.exit_error) ? 'executed' : 'error'
-    results.push({ symbol: r.symbol, status, entry_order: r.entry_order, sl_order: r.sl_order, tp_order: r.tp_order, error: r.entry_error || r.exit_error || null })
+    const mainError = r.entry_error || r.exit_error || null
+    results.push({ 
+      symbol: r.symbol, 
+      status, 
+      entry_order: r.entry_order, 
+      sl_order: r.sl_order, 
+      tp_order: r.tp_order, 
+      error: mainError
+    })
   })
 
   const success = results.every(r => r.status === 'executed')

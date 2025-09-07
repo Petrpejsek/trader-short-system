@@ -2,7 +2,7 @@
   "profile": "lean",
   "topK": 12,
   "hard_gates": {
-    "min_quote_volume_usd": 5000000,
+    "min_quote_volume_usd": 10000000,
     "min_trades_24h": 20000,
     "atr_pct_h1_min": 1,
     "atr_pct_h1_max": 12

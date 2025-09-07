@@ -24,7 +24,11 @@ export function decideFromFeatures(f: FeaturesSnapshot): MarketDecision {
     }
   }
 
-  if (((btc.atr_pct_H1 ?? 0) > 3.5 || (eth.atr_pct_H1 ?? 0) > 3.5) && br < 40) {
+  // STRICT: Validate ATR data explicitly - no soft fallbacks
+  if (!Number.isFinite(btc.atr_pct_H1) || !Number.isFinite(eth.atr_pct_H1)) {
+    throw new Error('Invalid ATR data for BTC/ETH - no fallbacks allowed')
+  }
+  if ((btc.atr_pct_H1 > 3.5 || eth.atr_pct_H1 > 3.5) && br < 40) {
     return {
       flag: 'CAUTION', posture: 'NEUTRAL', market_health: 45, expiry_minutes: 60,
       reasons: ['vysoká volatilita', 'slabá šířka trhu'], risk_cap: { max_concurrent: 2, risk_per_trade_max: 0.5 }

@@ -10,7 +10,7 @@ import { runFinalPicker as runFinalPickerServer } from '../services/decider/fina
 import { runHotScreener } from '../services/decider/hot_screener_gpt'
 import { runEntryStrategy } from '../services/decider/entry_strategy_gpt'
 import { executeHotTradingOrders, type PlaceOrdersRequest, fetchMarkPrice, fetchLastTradePrice, fetchAllOpenOrders, fetchPositions, cancelOrder, getBinanceAPI, getWaitingTpList, cleanupWaitingTpForSymbol, waitingTpProcessPassFromPositions, rehydrateWaitingFromDiskOnce } from '../services/trading/binance_futures'
-import { ttlGet, ttlSet, makeKey } from './lib/ttlCache'
+// TTL Cache removed - strict no-cache policy
 import { preflightCompact } from '../services/decider/market_compact'
 import deciderCfg from '../config/decider.json'
 import tradingCfg from '../config/trading.json'
@@ -89,23 +89,46 @@ function hasRealBinanceKeysGlobal(): boolean {
 
 async function sweepStaleOrdersOnce(): Promise<void> {
   if (__sweeperRunning) return
-  if (!hasRealBinanceKeysGlobal()) return
-  if (!Number.isFinite(__pendingCancelAgeMin) || __pendingCancelAgeMin <= 0) return
+  if (!hasRealBinanceKeysGlobal()) {
+    console.error('[SWEEPER_SKIP]', { reason: 'no_real_binance_keys' })
+    return
+  }
+  if (!Number.isFinite(__pendingCancelAgeMin) || __pendingCancelAgeMin <= 0) {
+    console.error('[SWEEPER_SKIP]', { reason: 'age_disabled', pendingCancelAgeMin: __pendingCancelAgeMin })
+    return
+  }
   // During Binance backoff window, do not hit REST at all
-  if (Number(__binanceBackoffUntilMs) > Date.now()) return
+  if (Number(__binanceBackoffUntilMs) > Date.now()) {
+    console.error('[SWEEPER_SKIP]', { reason: 'binance_backoff' })
+    return
+  }
+  console.error('[SWEEPER_RUN_START]', { pendingCancelAgeMin: __pendingCancelAgeMin })
   __sweeperRunning = true
   try {
     const now = Date.now()
     const ageMs = __pendingCancelAgeMin * 60 * 1000
-    const raw = await fetchAllOpenOrders()
+    // OPRAVENO: Používej stejné ordery jako UI (WS snapshot, ne REST)
+    const raw = getOpenOrdersInMemory()
+    console.error('[SWEEPER_RAW_ORDERS]', { count: Array.isArray(raw) ? raw.length : 0 })
     const candidates = (Array.isArray(raw) ? raw : []).map((o: any) => ({
       symbol: String(o?.symbol || ''),
       orderId: Number(o?.orderId ?? o?.orderID ?? 0) || 0,
-      createdAtMs: (() => { const t = Number((o as any)?.time); return Number.isFinite(t) && t > 0 ? t : null })()
+      createdAtMs: (() => { const t = Number((o as any)?.time); return Number.isFinite(t) && t > 0 ? t : null })(),
+      clientId: String(o?.clientOrderId || '') || null,
+      side: String(o?.side || ''),
+      type: String(o?.type || ''),
+      reduceOnly: Boolean(o?.reduceOnly ?? false),
+      closePosition: Boolean(o?.closePosition ?? false)
     }))
     .filter(o => o.symbol && o.orderId && Number.isFinite(o.createdAtMs as any))
     .filter(o => (now - (o.createdAtMs as number)) > ageMs)
+    .filter(o => {
+      // JEDNODUŠE: maž podle AGE + není external
+      const internal = /^(e_l_|x_sl_|x_tp_tm_|x_tp_l_)/.test(o.clientId || '')
+      return internal  // Jen naše internal ordery
+    })
 
+    console.error('[SWEEPER_CANDIDATES]', { count: candidates.length, candidates: candidates.map(c => ({ symbol: c.symbol, orderId: c.orderId, ageMin: Math.round((now - (c.createdAtMs as number)) / (1000 * 60)) })) })
     if (candidates.length === 0) return
 
     let anyCancelled = false
@@ -123,7 +146,7 @@ async function sweepStaleOrdersOnce(): Promise<void> {
     }
     if (anyCancelled) {
       __sweeperDidAutoCancel = true
-      try { ttlSet(makeKey('/api/open_orders'), null as any, 1) } catch {}
+      // Cache invalidation removed - strict no-cache policy
     }
   } catch (e) {
     try { console.error('[SWEEPER_ERROR]', (e as any)?.message || e) } catch {}
@@ -135,7 +158,9 @@ async function sweepStaleOrdersOnce(): Promise<void> {
 function startOrderSweeper(): void {
   if (__sweeperTimer) return
   const ms = Number((tradingCfg as any)?.OPEN_ORDERS_SWEEP_MS ?? 10000)
+  console.error('[SWEEPER_STARTING]', { intervalMs: ms, pendingCancelAgeMin: __pendingCancelAgeMin })
   __sweeperTimer = setInterval(() => { sweepStaleOrdersOnce().catch(()=>{}) }, ms)
+  console.error('[SWEEPER_STARTED]', { intervalMs: ms })
 }
 
 // Rehydrate waiting TP list from disk (if any) early during startup
@@ -375,15 +400,16 @@ const server = http.createServer(async (req, res) => {
         } catch {}
         try { pushAudit({ ts: new Date().toISOString(), type: 'cancel', source: 'server', symbol, orderId, reason: 'manual_delete' }) } catch {}
         
-        // Auto-cleanup waiting TP if this was an ENTRY order
+        // Manual cleanup waiting TP if this was an ENTRY order - ONLY for manual delete, not automatic!
         try {
           const orderInfo = r || {}
           const wasEntryOrder = (
-            String(orderInfo?.side) === 'BUY' && 
+            String(orderInfo?.side) === 'SELL' && 
             String(orderInfo?.type) === 'LIMIT' && 
             !(orderInfo?.reduceOnly || orderInfo?.closePosition)
           )
           if (wasEntryOrder) {
+            console.error('[MANUAL_DELETE_CLEANUP_TP]', { symbol, orderId, reason: 'manual_entry_delete' })
             cleanupWaitingTpForSymbol(symbol)
           }
         } catch {}
@@ -593,7 +619,17 @@ const server = http.createServer(async (req, res) => {
         // Fast-path auto-clean čekajících TP jen pokud jsou WS data READY (jinak hrozí falešné mazání)
         try {
           if (ordersReady && positionsReady) {
-            const hasEntry = (o: any): boolean => String(o?.side) === 'BUY' && String(o?.type) === 'LIMIT' && !(o?.reduceOnly || o?.closePosition)
+            const hasEntry = (o: any): boolean => {
+              const ns = String(process.env.CLIENT_ID_NS || 'short_real')
+              const clientId = String(o?.clientOrderId || '') || null
+              const internal = (
+                clientId?.startsWith(`e_l_${ns}_`) ||
+                clientId?.startsWith(`x_sl_${ns}_`) ||
+                clientId?.startsWith(`x_tp_tm_${ns}_`) ||
+                clientId?.startsWith(`x_tp_l_${ns}_`)
+              )
+              return internal && String(o?.side) === 'BUY' && String(o?.type) === 'LIMIT' && !(o?.reduceOnly || o?.closePosition)
+            }
             const entrySymbols = new Set<string>()
             for (const o of (Array.isArray(ordersRaw) ? ordersRaw : [])) {
               try { if (hasEntry(o)) entrySymbols.add(String(o?.symbol || '')) } catch {}
@@ -607,19 +643,30 @@ const server = http.createServer(async (req, res) => {
                 if (sym) posSizeBySym.set(sym, size)
               } catch {}
             }
-            const pending = getWaitingTpList()
-            for (const w of (Array.isArray(pending) ? pending : [])) {
-              try {
-                const sym = String(w?.symbol || '')
-                if (!sym) continue
-                const size = Number(posSizeBySym.get(sym) || 0)
-                if (!entrySymbols.has(sym) && size === 0) {
-                  cleanupWaitingTpForSymbol(sym)
-                }
-              } catch {}
-            }
           }
         } catch {}
+        
+        // Cleanup STARÝCH waiting TP orders (starších než 30 minut) - MIMO try-catch aby se vždy spustil
+        try {
+          const pending = getWaitingTpList()
+          console.error('[CLEANUP_START]', { pendingCount: Array.isArray(pending) ? pending.length : 0 })
+          for (const w of (Array.isArray(pending) ? pending : [])) {
+            try {
+              const sym = String(w?.symbol || '')
+              if (!sym) continue
+              const ageMinutes = (Date.now() - new Date(w.since).getTime()) / (1000 * 60)
+              console.error('[CLEANUP_CHECK]', { symbol: sym, ageMinutes: Math.round(ageMinutes), willDelete: ageMinutes > 30 })
+              if (ageMinutes > 30) {
+                console.error('[CLEANUP_OLD_WAITING_TP]', { symbol: sym, ageMinutes: Math.round(ageMinutes) })
+                cleanupWaitingTpForSymbol(sym)
+              }
+            } catch (e) {
+              console.error('[CLEANUP_ERROR]', { error: e?.message })
+            }
+          }
+        } catch (e) {
+          console.error('[CLEANUP_FATAL_ERROR]', { error: e?.message })
+        }
         // Strict režim: ŽÁDNÉ REST refresh fallbacky uvnitř orders_console – pouze aktuální WS snapshoty
 
         // Spusť waiting TP processing pass na základě pozic (bez dalšího dodatečného REST čtení)
@@ -628,12 +675,13 @@ const server = http.createServer(async (req, res) => {
         const marks: Record<string, number> = {}
         try {
           if (Number(__binanceBackoffUntilMs) > Date.now()) { throw new Error(`banned until ${__binanceBackoffUntilMs}`) }
-          // 1) ENTRY orders (BUY LIMIT, not reduceOnly/closePosition)
+          // 1) ENTRY orders (LIMIT, not reduceOnly/closePosition) - both BUY (LONG) and SELL (SHORT)
           const entrySymbols: string[] = []
           try {
             for (const o of (Array.isArray(ordersRaw) ? ordersRaw : [])) {
               try {
-                const isEntry = String(o?.side) === 'BUY' && String(o?.type) === 'LIMIT' && !(o?.reduceOnly || o?.closePosition)
+                // FIXED: Entry orders can be BUY (LONG) or SELL (SHORT) - check type and flags only
+                const isEntry = String(o?.type) === 'LIMIT' && !(o?.reduceOnly || o?.closePosition)
                 if (isEntry) entrySymbols.push(String(o?.symbol || ''))
               } catch {}
             }
@@ -704,31 +752,48 @@ const server = http.createServer(async (req, res) => {
           }
         } catch {}
         // Normalize open orders to UI shape (consistent with /api/open_orders)
-        let openOrdersUi = (Array.isArray(ordersRaw) ? ordersRaw : []).map((o: any) => ({
-          orderId: Number(o?.orderId ?? o?.orderID ?? 0) || 0,
-          symbol: String(o?.symbol || ''),
-          side: String(o?.side || ''),
-          type: String(o?.type || ''),
-          qty: (() => { const n = Number(o?.origQty ?? o?.quantity ?? o?.qty); return Number.isFinite(n) ? n : null })(),
-          price: (() => { const n = Number(o?.price); return Number.isFinite(n) && n > 0 ? n : null })(),
-          stopPrice: (() => { const n = Number(o?.stopPrice); return Number.isFinite(n) && n > 0 ? n : null })(),
-          timeInForce: o?.timeInForce ? String(o.timeInForce) : null,
-          reduceOnly: Boolean(o?.reduceOnly ?? false),
-          closePosition: Boolean(o?.closePosition ?? false),
-          positionSide: (typeof o?.positionSide === 'string' && o.positionSide) ? String(o.positionSide) : null,
-          createdAt: (() => {
-            if (typeof (o as any)?.createdAt === 'string') return String((o as any).createdAt)
-            const t = Number((o as any)?.time)
-            return Number.isFinite(t) && t > 0 ? new Date(t).toISOString() : null
-          })(),
-          updatedAt: (() => {
-            if (typeof (o as any)?.updatedAt === 'string') return String((o as any).updatedAt)
-            const tu = Number((o as any)?.updateTime)
-            if (Number.isFinite(tu) && tu > 0) return new Date(tu).toISOString()
-            const tt = Number((o as any)?.time)
-            return Number.isFinite(tt) && tt > 0 ? new Date(tt).toISOString() : null
+        let openOrdersUi = (Array.isArray(ordersRaw) ? ordersRaw : []).map((o: any) => {
+          const clientOrderId = String(o?.clientOrderId || '') || null
+          const ns = String(process.env.CLIENT_ID_NS || 'short_real')
+          const isExternal = (() => { 
+            const id = String(o.clientOrderId || '')
+            if (!id) return true
+            const patterns = [`e_l_${ns}_`, `x_sl_${ns}_`, `x_tp_tm_${ns}_`, `x_tp_l_${ns}_`]
+            const isInternal = patterns.some(pattern => id.startsWith(pattern))
+            if (o.type === 'TAKE_PROFIT') {
+              console.error('[EXTERNAL_DEBUG_TP]', { symbol: o.symbol, clientOrderId: id, ns, patterns, isInternal, willBeExternal: !isInternal })
+            }
+            return !isInternal
           })()
-        }))
+          
+          return {
+            orderId: Number(o?.orderId ?? o?.orderID ?? 0) || 0,
+            symbol: String(o?.symbol || ''),
+            side: String(o?.side || ''),
+            type: String(o?.type || ''),
+            qty: (() => { const n = Number(o?.origQty ?? o?.quantity ?? o?.qty); return Number.isFinite(n) ? n : null })(),
+            price: (() => { const n = Number(o?.price); return Number.isFinite(n) && n > 0 ? n : null })(),
+            stopPrice: (() => { const n = Number(o?.stopPrice); return Number.isFinite(n) && n > 0 ? n : null })(),
+            timeInForce: o?.timeInForce ? String(o.timeInForce) : null,
+            reduceOnly: Boolean(o?.reduceOnly ?? false),
+            closePosition: Boolean(o?.closePosition ?? false),
+            positionSide: (typeof o?.positionSide === 'string' && o.positionSide) ? String(o.positionSide) : null,
+            createdAt: (() => {
+              if (typeof (o as any)?.createdAt === 'string') return String((o as any).createdAt)
+              const t = Number((o as any)?.time)
+              return Number.isFinite(t) && t > 0 ? new Date(t).toISOString() : null
+            })(),
+            updatedAt: (() => {
+              if (typeof (o as any)?.updatedAt === 'string') return String((o as any).updatedAt)
+              const tu = Number((o as any)?.updateTime)
+              if (Number.isFinite(tu) && tu > 0) return new Date(tu).toISOString()
+              const tt = Number((o as any)?.time)
+              return Number.isFinite(tt) && tt > 0 ? new Date(tt).toISOString() : null
+            })(),
+            clientOrderId,
+            isExternal
+          }
+        })
         // Attach leverage and investedUsd per order for complete UI rendering (no extra calls)
         try {
           openOrdersUi = openOrdersUi.map((o: any) => {
@@ -1439,21 +1504,16 @@ const server = http.createServer(async (req, res) => {
               ))
             } catch { return false }
           }
-          const THROTTLE_MS = 8000
+          // STRICT: No TTL cache throttling - only check existing open orders
           const filtered: PlaceOrdersRequest['orders'] = [] as any
           for (const o of parsed.orders) {
             const sym = String((o as any)?.symbol || '')
             if (!sym) continue
-            const key = makeKey('entry_throttle', sym)
-            const recent = ttlGet(key)
-            if (recent != null) { try { console.error('[ENTRY_THROTTLED_RECENT]', { symbol: sym }) } catch {} ; continue }
             if (hasEntryOpen(sym)) {
-              try { console.error('[ENTRY_THROTTLED_OPEN]', { symbol: sym }) } catch {}
-              try { ttlSet(key, Date.now(), Math.ceil(THROTTLE_MS/1000)) } catch {}
+              try { console.error('[ENTRY_BLOCKED_OPEN_EXISTS]', { symbol: sym }) } catch {}
               continue
             }
             filtered.push(o)
-            try { ttlSet(key, Date.now(), Math.ceil(THROTTLE_MS/1000)) } catch {}
           }
           parsed.orders = filtered
           if (parsed.orders.length === 0) {
@@ -1802,7 +1862,11 @@ const server = http.createServer(async (req, res) => {
         return
       }
       try {
-        const mode = String(process.env.DECIDER_MODE || 'mock').toLowerCase()
+        // STRICT: DECIDER_MODE required - no mock fallbacks allowed
+        if (!process.env.DECIDER_MODE) {
+          throw new Error('DECIDER_MODE environment variable required - no mock fallbacks allowed')
+        }
+        const mode = String(process.env.DECIDER_MODE).toLowerCase()
         if (mode === 'gpt' && !process.env.OPENAI_API_KEY) {
           // 403 to avoid triggering proxy Basic Auth dialogs
           res.statusCode = 403
@@ -1989,7 +2053,18 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`)
+  
+  // Initialize sweeper settings from config
+  try {
+    const sweepAgeMin = Number((tradingCfg as any)?.pending_cancel_age_min ?? 40)
+    __pendingCancelAgeMin = sweepAgeMin
+    console.error('[SWEEPER_INIT]', { pendingCancelAgeMin: __pendingCancelAgeMin })
+  } catch (e) {
+    console.error('[SWEEPER_INIT_ERR]', (e as any)?.message || e)
+  }
+  
   try { startOrderSweeper() } catch (e) { console.error('[SWEEPER_START_ERR]', (e as any)?.message || e) }
 })
+
 
 

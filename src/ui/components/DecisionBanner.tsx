@@ -116,7 +116,7 @@ export const DecisionBanner: React.FC<Props> = ({ decision, rawBtcH1, btc, eth, 
     }
     if (hasB && b >= 1.0) return { text: `Silné momentum BTC (${b.toFixed(2)}%). Vítr v zádech, pozor na pullbacky.`, color: '#065f46' }
     if (hasB && b >= 0.3) return { text: `BTC zelené (${b.toFixed(2)}%). Podmínky příznivé, ale kontroluj risk.`, color: '#065f46' }
-    // Bez BTC signálu – fallback dle health
+    // STRICT: No BTC signal fallback - use explicit health logic
     if (h >= 70) return { text: 'Tržní zdraví vysoké. Vítr v zádech.', color: '#065f46' }
     if (h <= 30) return { text: 'Tržní zdraví slabé. Riziko zvýšené.', color: '#b91c1c' }
     return { text: 'Smíšené podmínky. Řiď se kvalitou setupu a risk managementem.', color: '#92400e' }

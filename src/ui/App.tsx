@@ -77,7 +77,7 @@ export const App: React.FC = () => {
     if (prevStrategyRef.current !== universeStrategy) {
       setRawCoins(null)
       setRawCoinsTs(null)
-      try { localStorage.removeItem('rawCoins') } catch {}
+      // No localStorage cache for rawCoins - strict no-cache policy
     }
     prevStrategyRef.current = universeStrategy
   }, [universeStrategy])
@@ -99,7 +99,7 @@ export const App: React.FC = () => {
   const [defaultPreset, setDefaultPreset] = useState<'conservative'|'aggressive'>('conservative')
 
   // Global defaults controlled in HeaderBar
-  const [defaultSide, setDefaultSide] = useState<'LONG'|'SHORT'>('LONG')
+  const [defaultSide, setDefaultSide] = useState<'LONG'|'SHORT'>('SHORT')
   const [defaultTPLevel, setDefaultTPLevel] = useState<'tp1'|'tp2'|'tp3'>('tp2')
   const [defaultAmount, setDefaultAmount] = useState<number>(20)
   const [defaultLeverage, setDefaultLeverage] = useState<number>(15)
@@ -200,7 +200,7 @@ export const App: React.FC = () => {
     try {
       const nowMs = Date.now();
       setRunStartedAt(nowMs);
-      try { localStorage.setItem('lastRunAtMs', String(nowMs)) } catch {}
+      // No localStorage cache for run timestamps - strict no-cache policy
       async function fetchJsonWithTimeout<T=any>(input: RequestInfo | URL, init: RequestInit & { timeoutMs?: number } = {}): Promise<{ ok: boolean; status: number; json: T | null }> {
         const ac = new AbortController()
         const timeoutMs = init.timeoutMs ?? 30000
@@ -244,7 +244,12 @@ export const App: React.FC = () => {
       setFeaturesMs(dt);
       // M3: strict GPT via backend when enabled; no silent fallback
       let dec: MarketDecision
-      const mode = String((import.meta as any).env?.VITE_DECIDER_MODE || (globalThis as any).DECIDER_MODE || 'mock').toLowerCase()
+      // STRICT: DECIDER_MODE required - no mock fallbacks allowed
+      const envMode = (import.meta as any).env?.VITE_DECIDER_MODE || (globalThis as any).DECIDER_MODE
+      if (!envMode) {
+        throw new Error('DECIDER_MODE environment variable required - no mock fallbacks allowed')
+      }
+      const mode = String(envMode).toLowerCase()
       if (mode === 'gpt') {
         const compact = buildMarketCompact(feats, data)
         const resp = await fetch('/api/decide', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(compact) })
@@ -254,12 +259,16 @@ export const App: React.FC = () => {
             const meta = (dec as any)?.meta || {}
             const reasons: string[] = Array.isArray((dec as any)?.reasons) ? (dec as any).reasons : []
             const status = reasons.some((r: string) => String(r||'').startsWith('gpt_error:')) ? 'error' : 'ok'
-            const m = { status, latencyMs: Number(meta.latencyMs ?? 0), error_code: meta.error_code ?? null, prompt_hash: meta.prompt_hash ?? null, schema_version: meta.schema_version ?? null, http_status: meta.http_status ?? null, http_error: meta.http_error ?? null }
-            localStorage.setItem('m3DecisionMeta', JSON.stringify(m))
+            // STRICT: Validate meta fields explicitly - no nullish coalescing fallbacks
+            if (!Number.isFinite(meta.latencyMs)) {
+              throw new Error('Invalid latencyMs in decision meta - no fallbacks allowed')  
+            }
+            const m = { status, latencyMs: Number(meta.latencyMs), error_code: meta.error_code || null, prompt_hash: meta.prompt_hash || null, schema_version: meta.schema_version || null, http_status: meta.http_status || null, http_error: meta.http_error || null }
+            // No localStorage cache for decision meta - strict no-cache policy
           } catch {}
         } else {
           dec = { flag: 'NO-TRADE', posture: 'RISK-OFF', market_health: 0, expiry_minutes: 30, reasons: ['gpt_error:http'], risk_cap: { max_concurrent: 0, risk_per_trade_max: 0 } }
-          try { localStorage.setItem('m3DecisionMeta', JSON.stringify({ status: 'error', error_code: 'http', latencyMs: 0 })) } catch {}
+          // No localStorage cache for error meta - strict no-cache policy
         }
       } else {
         dec = decideFromFeatures(feats)
@@ -363,7 +372,7 @@ export const App: React.FC = () => {
               prompt_hash: (res as any)?.meta?.prompt_hash ?? null,
               schema_version: (res as any)?.meta?.schema_version ?? null
             }
-            try { localStorage.setItem('m4FinalPicker', JSON.stringify(telem)); if (picksCount != null) localStorage.setItem('m4FinalPicks', JSON.stringify(res?.data?.picks ?? [])) } catch {}
+            // No localStorage cache for final picker data - strict no-cache policy
             // eslint-disable-next-line no-console
             try { const mode = (import.meta as any)?.env?.MODE || (process as any)?.env?.NODE_ENV; if (mode !== 'production') console.info('finalPicker', { code, latencyMs: latency ?? 0 }) } catch {}
           }
@@ -417,7 +426,7 @@ export const App: React.FC = () => {
             ts: new Date().toISOString(), posture: dec.flag, candidatesCount: candidates.length, status: 'error', picksCount: 0,
             advisory: dec.flag === 'NO-TRADE', no_trade: { allow: allowNoTrade, maxPicks: Number(fpCfg.max_picks_no_trade ?? 3), confFloor: Number(fpCfg.confidence_floor_no_trade ?? 0.65), riskDefault: Number(fpCfg.risk_pct_no_trade_default ?? 0.0) }, settings_snapshot: { max_leverage: (()=>{ try { const v = Number(localStorage.getItem('max_leverage')); return Number.isFinite(v) ? v : 20 } catch { return 20 } })() }, latencyMs: 0, error_code: 'unknown'
           }
-          try { localStorage.setItem('m4FinalPicker', JSON.stringify(telem)); localStorage.setItem('m4FinalPicks', JSON.stringify([])) } catch {}
+          // No localStorage cache for final picker error data - strict no-cache policy
         }
       }
 
@@ -878,14 +887,39 @@ export const App: React.FC = () => {
         console.log('[UI_ORDER_MAP]', { symbol: c.symbol, strategy: c.strategy, tpLevel: c.tpLevel, plan: { entry, sl, tp: tpVal } })
         console.log('[UI_PAYLOAD_VS_DISPLAY]', JSON.stringify({ symbol: c.symbol, payload: { entry, sl, tp: tpVal }, note: 'Check if this matches UI display' }, null, 2))
 
+        // RAW quantity pro Binance Futures: qty = (amount * leverage) / entry
+        const qty = (() => {
+          const amt = Number(c.amount)
+          const lev = Number(c.leverage)
+          if (!Number.isFinite(amt) || !Number.isFinite(lev) || !Number.isFinite(entry)) return ''
+          if (amt <= 0 || lev <= 0 || entry <= 0) return ''
+          const rawQty = (amt * lev) / entry
+          
+          // Zaokrouhlit quantity podle typického stepSize pro různé symboly
+          // Pro většinu USDT párů je stepSize 0.001, 0.01, 0.1, nebo 1
+          let roundedQty: number
+          if (rawQty >= 1000) {
+            roundedQty = Math.floor(rawQty) // Celá čísla pro velké quantity
+          } else if (rawQty >= 10) {
+            roundedQty = Math.floor(rawQty * 10) / 10 // 1 desetinné místo
+          } else if (rawQty >= 1) {
+            roundedQty = Math.floor(rawQty * 100) / 100 // 2 desetinná místa  
+          } else {
+            roundedQty = Math.floor(rawQty * 1000) / 1000 // 3 desetinná místa
+          }
+          
+          return String(roundedQty)
+        })()
+
         return {
           symbol: c.symbol,
-          side: (c.side || 'LONG') as any,
+          side: (c.side || 'SHORT') as any,
           strategy: c.strategy,
           tpLevel: c.tpLevel,
           orderType: c.orderType || (c.strategy === 'conservative' ? 'limit' : 'stop_limit'),
           amount: c.amount,
           leverage: c.leverage,
+          quantity: qty,
           entry,
           sl,
           tp: tpVal
@@ -900,6 +934,7 @@ export const App: React.FC = () => {
           if (!(typeof o.entry === 'number' && Number.isFinite(o.entry) && o.entry > 0)) issues.push('ENTRY')
           if (!(typeof o.sl === 'number' && Number.isFinite(o.sl) && o.sl > 0)) issues.push('SL')
           if (!(typeof o.tp === 'number' && Number.isFinite(o.tp) && o.tp > 0)) issues.push('TP')
+          if (!(typeof (o as any).quantity === 'string' && Number((o as any).quantity) > 0)) issues.push('QTY')
           if (issues.length) badNum.push(`${o.symbol}: missing ${issues.join(', ')}`)
         }
         if (badNum.length) {
@@ -1170,7 +1205,7 @@ export const App: React.FC = () => {
             <div className="error" style={{ marginTop: 8 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <strong>Final Picker selhal (STRICT NO-FALLBACK)</strong>
-                <button className="btn" onClick={() => { try { const raw = localStorage.getItem('m4FinalPicker'); if (raw) navigator.clipboard.writeText(raw) } catch {} }}>Copy details</button>
+                <button className="btn" onClick={() => { /* No localStorage cache - removed per strict no-cache policy */ }}>Copy details (disabled)</button>
               </div>
               <div style={{ fontSize: 12, opacity: .9, marginTop: 4 }}>Code: {finalPickerMeta?.error_code ?? 'unknown'}</div>
             </div>

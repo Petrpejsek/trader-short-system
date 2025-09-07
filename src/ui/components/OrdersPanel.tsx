@@ -14,6 +14,8 @@ type OpenOrderUI = {
   positionSide?: 'LONG' | 'SHORT' | string | null
   createdAt?: string | null
   updatedAt: string | null
+  clientOrderId?: string | null
+  isExternal?: boolean
 }
 
 type WaitingOrderUI = {
@@ -44,6 +46,9 @@ type PositionUI = {
 
 const POLL_MS = 5000
 
+// Helper function to detect external orders
+const isExternalOrder = (o: OpenOrderUI): boolean => Boolean(o?.isExternal === true)
+
 export const OrdersPanel: React.FC = () => {
   const [orders, setOrders] = useState<OpenOrderUI[]>([])
   const [positions, setPositions] = useState<PositionUI[]>([])
@@ -59,6 +64,7 @@ export const OrdersPanel: React.FC = () => {
   const [lastLeverageBySymbol, setLastLeverageBySymbol] = useState<Record<string, number>>({})
   const [cancellingIds, setCancellingIds] = useState<Set<number>>(new Set())
   const [backoffUntilMs, setBackoffUntilMs] = useState<number | null>(null)
+  const [showDebug, setShowDebug] = useState<boolean>(false)
   // no warmup mode – respecting single consolidated poll only
   const [pendingCancelAgeMin, setPendingCancelAgeMin] = useState<number>(() => {
     try { const v = localStorage.getItem('pending_cancel_age_min'); const n = v == null ? 0 : Number(v); return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0 } catch { return 0 }
@@ -170,7 +176,7 @@ export const OrdersPanel: React.FC = () => {
       // Handshake: if server indicates auto-cancel happened, disable locally and on server
       try {
         if (json && json.auto_cancelled_due_to_age) {
-          localStorage.removeItem('pending_cancel_age_min')
+          // localStorage.removeItem('pending_cancel_age_min') - no cache policy
           setPendingCancelAgeMin(0)
           await fetchJson('/api/trading/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pending_cancel_age_min: 0 }), timeoutMs: 30000 })
         }
@@ -179,8 +185,7 @@ export const OrdersPanel: React.FC = () => {
       try { if (marksObj && typeof marksObj === 'object') setMarks(marksObj) } catch {}
       // After successful sync, purge any localStorage remnants that could block fresh trades
       try {
-        const staleKeys = ['orders_console','open_orders','positions','waiting_tp']
-        staleKeys.forEach(k=>{ try { localStorage.removeItem(k) } catch {} })
+        // No localStorage cache to purge - strict no-cache policy
       } catch {}
       setLastRefresh(new Date().toISOString())
       // Successful fetch clears any previous backoff window
@@ -235,7 +240,8 @@ export const OrdersPanel: React.FC = () => {
     try {
       const ok = window.confirm('Cancel ALL visible open orders?')
       if (!ok) return
-      const ids = orders.map(o => ({ symbol: o.symbol, id: o.orderId })).filter(x => x.id)
+      // Close All jen interní objednávky
+      const ids = orders.filter(o => !isExternalOrder(o)).map(o => ({ symbol: o.symbol, id: o.orderId })).filter(x => x.id)
       setCancellingIds(new Set(ids.map(x => x.id)))
       await Promise.allSettled(ids.map(x => fetch(`/api/order?symbol=${encodeURIComponent(x.symbol)}&orderId=${encodeURIComponent(String(x.id))}`, { method: 'DELETE' })))
       await load()
@@ -252,7 +258,7 @@ export const OrdersPanel: React.FC = () => {
       const t = String(o.type || '').toUpperCase()
       const isTP = t.includes('TAKE_PROFIT')
       const isSL = t.includes('STOP') && !isTP
-      const isEntry = String(o.side || '').toUpperCase() === 'BUY' && !(o.reduceOnly || o.closePosition)
+      const isEntry = String(o.side || '').toUpperCase() === 'SELL' && !(o.reduceOnly || o.closePosition)
       if (isEntry) return 1
       if (isSL) return 2
       if (isTP) return 3
@@ -329,7 +335,7 @@ export const OrdersPanel: React.FC = () => {
     // Proaktivní vyčištění lokálního úložiště pro banner – prevence zobrazení starých dat
     try {
       const keys = ['orders_console', 'open_orders', 'positions', 'waiting_tp']
-      for (const k of keys) { try { localStorage.removeItem(k) } catch {} }
+      // No localStorage cache to clear - strict no-cache policy
     } catch {}
     // Warmup odstraněn – striktně jedno konsolidované volání bez dodatečných dotazů
     ;(async () => { if (mounted) { await syncPendingCancelFromServer(); await load(false) } })()
@@ -428,7 +434,7 @@ export const OrdersPanel: React.FC = () => {
   const positionsView = useMemo(() => {
     return positions.map(p => {
       const entry = Number(p.entryPrice)
-      // Resolve mark safely: prefer position.markPrice when valid, otherwise fallback to marks map; never coerce null to 0
+      // STRICT: Get mark price from position or marks map - no fallbacks, return NaN if invalid
       const markFromPos = (typeof p.markPrice === 'number' && Number.isFinite(p.markPrice) && p.markPrice > 0) ? p.markPrice : null
       const markFromMapNum = Number(marks[p.symbol])
       const mark = Number.isFinite(markFromPos as any)
@@ -722,6 +728,10 @@ export const OrdersPanel: React.FC = () => {
           <strong>Open Orders</strong>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             {lastRefresh ? (<span style={{ fontSize: 12, opacity: .75 }}>Refreshed: {new Date(lastRefresh as string).toLocaleTimeString()}</span>) : null}
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 12 }}>
+              <input type="checkbox" checked={showDebug} onChange={e => setShowDebug(e.target.checked)} />
+              <span style={{ opacity: .8 }}>Debug</span>
+            </label>
             <button className="btn" onClick={cancelAllOpenOrders} style={{ background: '#3a0d0d', border: '1px solid #6b1010', color: '#fff', padding: '2px 8px', fontSize: 12 }}>Close All</button>
             <span style={{ fontSize: 12, opacity: .8 }}>{orders.length}</span>
           </div>
@@ -738,6 +748,8 @@ export const OrdersPanel: React.FC = () => {
                   <th style={{ textAlign: 'left' }}>Side</th>
                   <th style={{ textAlign: 'left' }}>Pos</th>
                   <th style={{ textAlign: 'left' }}>Type</th>
+                  {showDebug ? (<th style={{ textAlign: 'left' }}>clientOrderId</th>) : null}
+                  {showDebug ? (<th style={{ textAlign: 'left' }}>isExternal</th>) : null}
                   <th style={{ textAlign: 'right' }}>Qty</th>
                   <th style={{ textAlign: 'right' }}>Invested $</th>
                   <th style={{ textAlign: 'right' }}>Lev</th>
@@ -753,16 +765,24 @@ export const OrdersPanel: React.FC = () => {
                 </tr>
               </thead>
               <tbody>
-                {stableOrders.map((o) => (
-                  <tr key={o.orderId}>
-                    <td>{o.orderId}</td>
-                    <td>{o.symbol}</td>
-                    <td>{o.side}</td>
+                {stableOrders.map((o) => {
+                  const ext = isExternalOrder(o)
+                  return (
+                    <tr key={o.orderId} style={ext ? { background: 'rgba(30,41,59,0.35)' } : undefined}>
+                      <td>{o.orderId}</td>
+                      <td>{o.symbol}</td>
+                      <td>
+                        {o.side}
+                        {ext ? <span style={{ marginLeft: 6, fontSize: 10, background: 'rgba(100,100,100,0.6)', color: '#fff', padding: '1px 4px', borderRadius: 3, fontWeight: 500 }}>external</span> : null}
+                      </td>
                     <td>{(() => { const ps = String(o.positionSide||''); if (!ps) return '-'; const col = ps==='LONG'?'#16a34a': ps==='SHORT'?'#dc2626': undefined; return <span style={{ color: col }}>{ps}</span> })()}</td>
                     <td>{o.type}</td>
+                    {showDebug ? (<td>{o.clientOrderId || '∅'}</td>) : null}
+                    {showDebug ? (<td>{String(o.isExternal === true ? 'true' : 'false')}</td>) : null}
                     <td style={{ textAlign: 'right' }}>{fmtNum(o.qty, 4)}</td>
                     <td style={{ textAlign: 'right' }}>{(() => {
-                      const isEntry = String(o.side).toUpperCase() === 'BUY' && !(o.reduceOnly || o.closePosition)
+                      // FIXED: Entry orders can be BUY (LONG) or SELL (SHORT) - check flags only
+                      const isEntry = !(o.reduceOnly || o.closePosition)
                       if (!isEntry) return '-'
                       const px = Number(o.price)
                       const qty = Number(o.qty)
@@ -774,9 +794,9 @@ export const OrdersPanel: React.FC = () => {
                     <td style={{ textAlign: 'right' }}>20</td>
                     <td style={{ textAlign: 'right' }}>{fmtNum(o.price, 6)}</td>
                     <td style={{ textAlign: 'right' }}>{fmtNum(o.stopPrice, 6)}</td>
-                    <td style={{ textAlign: 'right' }}>{String(o.side).toUpperCase() === 'BUY' ? fmtNum(marks[o.symbol], 6) : '-'}</td>
+                    <td style={{ textAlign: 'right' }}>{fmtNum(marks[o.symbol], 6)}</td>
                     <td style={{ textAlign: 'right' }}>
-                      {String(o.side).toUpperCase() === 'BUY' && !(o.reduceOnly || o.closePosition) ? (() => {
+                      {!(o.reduceOnly || o.closePosition) ? (() => {
                         const m = Number(marks[o.symbol])
                         const tgt = pickOrderTargetPrice(o)
                         if (Number.isFinite(m) && m > 0 && Number.isFinite(tgt as any) && (tgt as number) > 0) {
@@ -790,22 +810,25 @@ export const OrdersPanel: React.FC = () => {
                     <td>{o.timeInForce || '-'}</td>
                     <td>{[o.reduceOnly ? 'reduceOnly' : null, o.closePosition ? 'closePosition' : null].filter(Boolean).join(', ') || '-'}</td>
                     <td>
-                      {o.orderId ? (
-                        <button
-                          className="btn"
-                          onClick={() => cancelOne(o.symbol, o.orderId)}
-                          disabled={cancellingIds.has(o.orderId)}
-                          title="Cancel order"
-                          style={{ background: '#3a0d0d', border: '1px solid #6b1010', color: '#fff', padding: '0 6px', fontSize: 11 }}
-                        >
-                          {cancellingIds.has(o.orderId) ? '…' : 'Cancel'}
-                        </button>
-                      ) : '-'}
+                      {ext ? <span>—</span> : (
+                        o.orderId ? (
+                          <button
+                            className="btn"
+                            onClick={() => cancelOne(o.symbol, o.orderId)}
+                            disabled={cancellingIds.has(o.orderId)}
+                            title="Cancel order"
+                            style={{ background: '#3a0d0d', border: '1px solid #6b1010', color: '#fff', padding: '0 6px', fontSize: 11 }}
+                          >
+                            {cancellingIds.has(o.orderId) ? '…' : 'Cancel'}
+                          </button>
+                        ) : '-'
+                      )}
                     </td>
                     <td>{lastRefresh ? new Date(lastRefresh).toLocaleTimeString() : '-'}</td>
                     <td>{(() => { const min = ageMinutes(o.createdAt || null); const color = colorForAge(min); return <span style={{ color }}>{fmtAge(min)}</span> })()}</td>
                   </tr>
-                ))}
+                )
+                })}
               </tbody>
             </table>
           </div>

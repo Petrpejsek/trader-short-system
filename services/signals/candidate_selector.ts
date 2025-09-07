@@ -192,9 +192,9 @@ export function selectCandidates(
     return Number(Math.max(0, Math.min(1, out)).toFixed(4))
   }
   // Persist gate stats (optional, behind try/catch; feature-flag removed)
-  try { localStorage.setItem('cand_gate_stats', JSON.stringify({ ts: Date.now(), universe: coins.length, counts: gateCounts })) } catch {}
+  // No localStorage cache for gate stats - strict no-cache policy
 
-  const lastTopRaw = (()=>{ try { return JSON.parse(localStorage.getItem('lastTopK')||'') } catch { return null } })()
+  const lastTopRaw = null // No localStorage cache for lastTopK - strict no-cache policy
   const lastTs = lastTopRaw?.ts as number | undefined
   const lastMap: Record<string, { S: number, rank: number }> = {}
   try { for (const [idx, it] of (lastTopRaw?.items || []).entries()) lastMap[it.symbol] = { S: Number(it.S)||0, rank: idx+1 } } catch {}
@@ -241,12 +241,7 @@ export function selectCandidates(
         rsiM15: (c.RSI_M15 ?? undefined) as number | undefined,
         tier,
       }
-      // optional mock setup in preview mode (guarded, no-fallback)
-      const canSim = Boolean(opts.canComputeSimPreview) && (opts.finalPickerStatus !== 'error')
-      if (canSim && (signalsCfg as any)?.preview?.computeMockSetup) {
-        const m = buildMockSetup(c, signalsCfg as any)
-        if (m) base.simSetup = m
-      }
+      // No mock setups allowed - strict no-fallback policy
       ;(base as any).prev_rank = lastMap[c.symbol]?.rank ?? Infinity
       ;(base as any).S_after_sticky = (c as any).S_after_sticky ?? score
       return base
@@ -257,52 +252,10 @@ export function selectCandidates(
     // Always enforce configured TopK after sorting. Allow an optional additional cap via opts.limit for UI preview use-cases.
     .slice(0, Math.max(1, Math.min(desiredTopK, Number.isFinite(limit as any) ? Number(limit) : desiredTopK)))
   // Persist lastTopK for sticky (best-effort)
-  try { localStorage.setItem('lastTopK', JSON.stringify({ ts: Date.now(), items: ranked.map((r,i)=>({ symbol: r.symbol, S: r.score, rank: i+1 })) })) } catch {}
+  // No localStorage cache for lastTopK - strict no-cache policy
   return ranked
 }
 
-// Deterministic mock setup builder for preview-only levels
-export function buildMockSetup(c: CoinRow, cfg: any) {
-  const preview = (cfg?.preview) || {}
-  const px = c.price ?? null
-  const atrPct = c.atr_pct_H1 ?? null
-  const emaOrder = c.ema_order_H1
-  const rsi = c.RSI_M15 ?? 50
-  if (!px || !Number.isFinite(px)) return null
-  if (!atrPct || !Number.isFinite(atrPct)) return null
-  if (atrPct < (preview.min_atr_pct ?? 0.25) || atrPct > (preview.max_atr_pct ?? 8)) return null
-
-  let side: 'LONG' | 'SHORT' | null = null
-  if ((emaOrder === '20>50>200') && rsi >= 45) side = 'LONG'
-  else if ((emaOrder === '200>50>20') && rsi <= 55) side = 'SHORT'
-  else return null
-
-  const atrPx = px * (atrPct / 100)
-  const entryOff = preview.entry_offset_atr ?? 0.2
-  const slOff = preview.sl_offset_atr ?? 1.2
-  const tp1rr = preview.tp1_rrr ?? 1.5
-  const tp2rr = preview.tp2_rrr ?? 2.5
-  let entry: number, stop: number, tp1: number, tp2: number
-  if (side === 'LONG') {
-    entry = px - entryOff * atrPx
-    stop = entry - slOff * atrPx
-    tp1 = entry + tp1rr * (entry - stop)
-    tp2 = entry + tp2rr * (entry - stop)
-  } else {
-    entry = px + entryOff * atrPx
-    stop = entry + slOff * atrPx
-    tp1 = entry - tp1rr * (stop - entry)
-    tp2 = entry - tp2rr * (stop - entry)
-  }
-  if (![entry, stop, tp1, tp2].every(x => Number.isFinite(x) && x > 0)) return null
-  if ((side === 'LONG' && stop >= entry) || (side === 'SHORT' && stop <= entry)) return null
-
-  const eq = preview.account_equity_usd_preview ?? 10000
-  const riskPct = preview.risk_per_trade_pct_preview ?? 0.3
-  const riskUsd = Math.max(0, (eq * riskPct) / 100)
-  const riskPerUnit = Math.abs(entry - stop)
-  const sizeUsd = riskPerUnit > 0 ? riskUsd * (entry / riskPerUnit) : 0
-  return { side, entry, stop, tp1, tp2, rrr1: tp1rr, risk_usd: riskUsd, size_usd: Math.max(0, sizeUsd) }
-}
+// buildMockSetup function removed - no mock data allowed per strict no-fallback policy
 
 

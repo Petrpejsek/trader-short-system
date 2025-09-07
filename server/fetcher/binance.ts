@@ -338,20 +338,38 @@ export async function buildMarketRawSnapshot(opts?: { universeStrategy?: 'volume
   // When includeSymbols provided, expand target to accommodate them
   const hasIncludeSymbols = Array.isArray(opts?.includeSymbols) && opts!.includeSymbols!.length > 0
   const effectiveAltTarget = hasIncludeSymbols ? Math.max(altTarget, altTarget + opts!.includeSymbols!.length) : altTarget
-  // Pull a large candidate list (the endpoint returns all anyway)
+  // Pull a large candidate pool (24h tickers) a připrav SHORT mix (losers + overextended)
   const strategy = (opts?.universeStrategy || (config as any)?.universe?.strategy || 'volume') as 'volume'|'gainers'
   const fresh = Boolean(opts?.fresh)
-  const baseList = strategy === 'gainers' ? await getTopGainersUsdtSymbols(Math.max(200, desired * 10), fresh) : await getTopNUsdtSymbols(Math.max(200, desired * 10), fresh)
-  const extendedCandidates = baseList
-  const allAltCandidates = extendedCandidates.filter(s => s !== 'BTCUSDT' && s !== 'ETHUSDT' && filteredSymbols.includes(s))
+  const tickRaw = await withRetry(() => httpGet('/fapi/v1/ticker/24hr'), config.retry)
+  const tickEntries: Array<{ symbol: string; quoteVolume?: number; priceChangePercent?: number }> = Array.isArray(tickRaw) ? tickRaw.filter((e: any) => e?.symbol?.endsWith('USDT')) : []
+  const tickFiltered = tickEntries.filter((e: any) => filteredSymbols.includes(String(e.symbol)))
+  // losers: priceChangePercent < 0 (nejvíce ztrácející)
+  const losers = [...tickFiltered]
+    .filter(e => Number(e.priceChangePercent) < 0)
+    .sort((a, b) => Number(a.priceChangePercent) - Number(b.priceChangePercent))
+    .map(e => e.symbol)
+  // overextended: priceChangePercent > 0 (největší gainers) – pro fade
+  const gainers = [...tickFiltered]
+    .filter(e => Number(e.priceChangePercent) > 0)
+    .sort((a, b) => Number(b.priceChangePercent) - Number(a.priceChangePercent))
+    .map(e => e.symbol)
+  // Vyluč BTC/ETH z alt seznamu
+  const losersAlts = losers.filter(s => s !== 'BTCUSDT' && s !== 'ETHUSDT')
+  const gainersAlts = gainers.filter(s => s !== 'BTCUSDT' && s !== 'ETHUSDT')
+  // Cíl: altTarget = desired - 2 (BTC/ETH). Mix: až 35 losers + až 15 overextended, zbytek oříznout na altTarget.
+  const losersWanted = Math.min(35, Math.max(0, effectiveAltTarget))
+  const overWanted = Math.min(15, Math.max(0, effectiveAltTarget - losersWanted))
+  const mixed = losersAlts.slice(0, losersWanted).concat(gainersAlts.slice(0, overWanted))
+  // includeSymbols mají přednost (pokud jsou platné USDT a na futures)
   // Normalize includeSymbols and force them to the front of the alt list (if supported on futures USDT)
   const includeNorm = Array.from(new Set(((opts?.includeSymbols || []) as string[])
     .map(s => String(s || '').toUpperCase().replace('/', ''))
     .map(s => s.endsWith('USDT') ? s : `${s}USDT`)
     .filter(s => s !== 'BTCUSDT' && s !== 'ETHUSDT' && filteredSymbols.includes(s))))
-  // Merge include first, then candidate list without duplicates
-  const mergedPref = includeNorm.concat(allAltCandidates.filter(s => !includeNorm.includes(s)))
-  // Build universe symbol list
+  // Merge include first, then mixed list without duplicates
+  const mergedPref = includeNorm.concat(mixed.filter(s => !includeNorm.includes(s)))
+  // Build universe symbol list (alts only)
   const altSymbols: string[] = mergedPref.slice(0, effectiveAltTarget)
   const universeSymbols = altSymbols.slice()
 
@@ -500,9 +518,8 @@ export async function buildMarketRawSnapshot(opts?: { universeStrategy?: 'volume
       const last = m15[m15.length - 1]
       const d = new Date(last.openTime)
       d.setUTCDate(d.getUTCDate() - 1); d.setUTCHours(23, 59, 59, 999)
-      // fallback: approximate by H1 close 24 bars back
-      const h1c = h1.length >= 24 ? h1[h1.length - 24].close : null
-      return h1c ?? null
+      // STRICT: No fallbacks allowed - return null if insufficient data
+      return null
     })()
     item.h4_high = Array.isArray((btc as any)?.klines?.H4) ? Math.max(...((btc as any).klines.H4 as Kline[]).map(k=>k.high)) : null
     item.h4_low = Array.isArray((btc as any)?.klines?.H4) ? Math.min(...((btc as any).klines.H4 as Kline[]).map(k=>k.low)) : null
@@ -573,8 +590,8 @@ export async function buildMarketRawSnapshot(opts?: { universeStrategy?: 'volume
       const last = m15[m15.length - 1]
       const d = new Date(last.openTime)
       d.setUTCDate(d.getUTCDate() - 1); d.setUTCHours(23, 59, 59, 999)
-      const h1c = h1.length >= 24 ? h1[h1.length - 24].close : null
-      return h1c ?? null
+      // STRICT: No H1 fallbacks allowed - return null if insufficient data
+      return null
     })()
     item.h4_high = Array.isArray(h1) ? Math.max(...h1.map(k=>k.high)) : null
     item.h4_low = Array.isArray(h1) ? Math.min(...h1.map(k=>k.low)) : null

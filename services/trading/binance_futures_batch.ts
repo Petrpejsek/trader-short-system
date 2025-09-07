@@ -46,8 +46,13 @@ class BinanceFuturesAPI {
   private baseURL = 'https://fapi.binance.com'
 
   constructor() {
-    this.apiKey = process.env.BINANCE_API_KEY || 'mock_api_key'
-    this.secretKey = process.env.BINANCE_SECRET_KEY || 'mock_secret_key'
+    this.apiKey = process.env.BINANCE_API_KEY || ''
+    this.secretKey = process.env.BINANCE_SECRET_KEY || ''
+    
+    // STRICT: No fallbacks - crash without proper credentials
+    if (!this.apiKey || !this.secretKey || this.apiKey.includes('mock') || this.secretKey.includes('mock')) {
+      throw new Error('Missing or invalid Binance API credentials - no fallbacks allowed')
+    }
   }
 
   private sign(queryString: string): string {
@@ -286,7 +291,7 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
   const api = getBinanceAPI()
   const results: any[] = []
   const priceLogs: any[] = []
-  const makeId = (p: string) => `${p}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+  const makeId = (p: string) => `${p}_${String(process.env.CLIENT_ID_NS || 'short_real')}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
 
   const tpMode = ((tradingCfg as any)?.TP_MODE === 'LIMIT_ON_FILL') ? 'LIMIT_ON_FILL' as const : 'MARKET_PREENTRY' as const
   
@@ -347,8 +352,11 @@ export async function executeHotTradingOrdersV2(request: PlaceOrdersRequest): Pr
         }
       } catch {}
 
-      // Round all prices to proper Binance tickSize BEFORE preparing payload
-      const tickSize = filters.tickSize || 0.0001 // fallback
+      // STRICT: Validate tickSize - no null fallbacks allowed  
+      if (!Number.isFinite(filters.tickSize) || filters.tickSize <= 0) {
+        throw new Error(`Invalid or missing tickSize for ${order.symbol} - no fallbacks allowed`)
+      }
+      const tickSize = filters.tickSize
       const entryRounded = roundToTickSize(Number(order.entry), tickSize)
       const slRounded = roundToTickSize(Number(order.sl), tickSize)
       const tpRounded = roundToTickSize(Number(order.tp), tickSize)

@@ -6,7 +6,7 @@
   "allowWhenNoTrade": true,
   "preview": {
     "limit": 5,
-    "computeMockSetup": true,
+    "computeMockSetup": false,
     "account_equity_usd_preview": 10000,
     "risk_per_trade_pct_preview": 0.3,
     "entry_offset_atr": 0.2,

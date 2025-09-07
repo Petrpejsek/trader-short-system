@@ -9,8 +9,11 @@
   "PENDING_MAX_WAIT_MS": 120000,
   "TP_MODE": "MARKET_PREENTRY",
   "DISABLE_LIMIT_TP": false,
-  "RAW_PASSTHROUGH": true
-  ,"BINANCE_WEIGHT_LIMIT_1M": 6000
+  "RAW_PASSTHROUGH": true,
+  "BINANCE_WEIGHT_LIMIT_1M": 6000,
+  "CLIENT_ID_NS": "short",
+  "pending_cancel_age_min": 1,
+  "OPEN_ORDERS_SWEEP_MS": 10000
 }
 
 

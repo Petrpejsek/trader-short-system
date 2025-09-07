@@ -17,6 +17,18 @@ const openOrdersById: Map<number, any> = new Map()
 let hadAccountUpdate = false
 let hadOrderUpdate = false
 
+// Helper function to identify internal vs external orders
+function isInternalClientId(id: string | null | undefined): boolean {
+  const ns = String(process.env.CLIENT_ID_NS || 'short_real')
+  const s = String(id || '')
+  return (
+    s.startsWith(`e_l_${ns}_`) ||
+    s.startsWith(`x_sl_${ns}_`) ||
+    s.startsWith(`x_tp_tm_${ns}_`) ||
+    s.startsWith(`x_tp_l_${ns}_`)
+  )
+}
+
 export function startBinanceUserDataWs(opts: StartOpts): void {
   const apiKey = opts.apiKey || process.env.BINANCE_API_KEY || ''
   if (!apiKey || apiKey.includes('mock')) return // no real keys, skip
@@ -81,6 +93,7 @@ export function startBinanceUserDataWs(opts: StartOpts): void {
             const createdMs = Number((o as any)?.time)
             const updatedMs = Number((o as any)?.updateTime)
             const qty = Number(o?.origQty ?? o?.quantity ?? o?.qty)
+            const clientOrderId = String((o as any)?.clientOrderId || '') || null
             openOrdersById.set(id, {
               orderId: id,
               symbol: sym,
@@ -95,7 +108,8 @@ export function startBinanceUserDataWs(opts: StartOpts): void {
               positionSide,
               createdAt: Number.isFinite(createdMs) && createdMs > 0 ? new Date(createdMs).toISOString() : null,
               updatedAt: Number.isFinite(updatedMs) && updatedMs > 0 ? new Date(updatedMs).toISOString() : null,
-              status: 'NEW'
+              status: 'NEW',
+              clientOrderId
             })
           } catch {}
         }
@@ -151,6 +165,8 @@ export function startBinanceUserDataWs(opts: StartOpts): void {
       const ts = Number(o?.T ?? o?.E ?? Date.now())
       const status = String(o?.X || '')
       const qty = Number(o?.q ?? o?.Q ?? o?.origQty)
+      // Zachytit clientOrderId z různých možných polí
+      const clientOrderId = String((o as any)?.c || (o as any)?.C || (o as any)?.clientOrderId || '') || null
 
       // Preserve first-seen creation time per orderId for accurate Age in UI
       const prev = openOrdersById.get(id)
@@ -174,7 +190,8 @@ export function startBinanceUserDataWs(opts: StartOpts): void {
         positionSide,
         createdAt: createdAt as string | null,
         updatedAt: Number.isFinite(ts) ? new Date(ts).toISOString() : null,
-        status
+        status,
+        clientOrderId
       }
       // Update or remove based on status
       if (status === 'NEW' || status === 'PARTIALLY_FILLED') {
@@ -189,6 +206,37 @@ export function startBinanceUserDataWs(opts: StartOpts): void {
     } catch {}
   }
 
+  async function cancelSiblingExits(symbol: string, filledClientOrderId: string | null): Promise<void> {
+    try {
+      // Ignoruj externí fills
+      if (!isInternalClientId(filledClientOrderId)) return
+      
+      // Najdi všechny interní exit objednávky pro daný symbol
+      const siblingExits = Array.from(openOrdersById.values()).filter((o: any) => {
+        if (o.symbol !== symbol) return false
+        if (!isInternalClientId(o.clientOrderId)) return false
+        // Je to exit objednávka? (SL nebo TP)
+        const isExit = o.type && (/STOP/i.test(o.type) || /TAKE_PROFIT/i.test(o.type))
+        return isExit
+      })
+      
+      // Zrušit nalezené exit objednávky
+      for (const exitOrder of siblingExits) {
+        try {
+          // Import getBinanceAPI dynamicky
+          const { getBinanceAPI } = await import('../../trading/binance_futures')
+          const api = getBinanceAPI() as any
+          await api.cancelOrder({ symbol, orderId: exitOrder.orderId })
+          try { console.info('[SIBLING_CANCEL]', { symbol, orderId: exitOrder.orderId, clientOrderId: exitOrder.clientOrderId }) } catch {}
+        } catch (e: any) {
+          try { console.error('[SIBLING_CANCEL_ERR]', { symbol, orderId: exitOrder.orderId, error: e?.message || e }) } catch {}
+        }
+      }
+    } catch (e: any) {
+      try { console.error('[CANCEL_SIBLING_EXITS_ERR]', { symbol, error: e?.message || e }) } catch {}
+    }
+  }
+
   function handleOrderTradeUpdate(msg: any) {
     const o = msg?.o
     if (!o) return
@@ -199,11 +247,17 @@ export function startBinanceUserDataWs(opts: StartOpts): void {
       const orderId = Number(o?.i || 0)
       const side = String(o?.S || '')
       const otype = String(o?.o || '')
+      const clientOrderId = String((o as any)?.c || (o as any)?.C || (o as any)?.clientOrderId || '') || null
+      
       if (symbol) {
         if (status === 'CANCELED' || status === 'EXPIRED') {
           opts.audit({ type: 'cancel', symbol, orderId, side, otype, source: 'binance_ws', reason: status.toLowerCase(), payload: o })
         } else if (status === 'FILLED' || status === 'TRADE') {
           opts.audit({ type: 'filled', symbol, orderId, side, otype, source: 'binance_ws', reason: null, payload: o })
+          // Sibling auto-cancel jen pro interní filled objednávky
+          if (isInternalClientId(clientOrderId)) {
+            cancelSiblingExits(symbol, clientOrderId).catch(() => {})
+          }
         }
       }
     } catch {}
