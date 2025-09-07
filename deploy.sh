@@ -36,6 +36,7 @@ DEPLOY_USER="deploy"
 DOMAIN="${DOMAIN:-your-domain.com}"
 BRANCH="${BRANCH:-main}"
 NODE_VERSION="${NODE_VERSION:-18}"
+GIT_REPOSITORY="https://github.com/Petrpejsek/trader-short-system.git"
 
 # Cesty na serveru
 PROJECT_DIR="/var/www/${PROJECT_NAME}"
