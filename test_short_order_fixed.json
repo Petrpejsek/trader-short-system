@@ -1,0 +1,16 @@
+{
+  "orders": [
+    {
+      "symbol": "BTCUSDT",
+      "side": "SHORT",
+      "strategy": "conservative", 
+      "tpLevel": "tp1",
+      "orderType": "limit",
+      "amount": 50,
+      "leverage": 2,
+      "entry": 110200,
+      "sl": 110800,
+      "tp": 109600
+    }
+  ]
+}
